@@ -42,6 +42,10 @@ export const facturasAPI = {
     const q = new URLSearchParams(params).toString();
     return request(`/facturas/reporte/resumen${q ? '?' + q : ''}`);
   },
+  controlPagos: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return request(`/facturas/reporte/control-pagos${q ? '?' + q : ''}`);
+  },
 };
 
 // ── Métodos de Pago ─────────────────────────────────────────
@@ -54,6 +58,7 @@ export const pagosAPI = {
   get: (id) => request(`/metodos-pago/${id}`),
   create: (body) => request('/metodos-pago', { method: 'POST', body: JSON.stringify(body) }),
   update: (id, body) => request(`/metodos-pago/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  confirmar: (id, body) => request(`/metodos-pago/${id}/confirmar`, { method: 'POST', body: JSON.stringify(body || {}) }),
   anular: (id) => request(`/metodos-pago/${id}/anular`, { method: 'POST', body: JSON.stringify({}) }),
   delete: (id) => request(`/metodos-pago/${id}`, { method: 'DELETE' }),
 };
@@ -61,6 +66,7 @@ export const pagosAPI = {
 // ── Conciliaciones ──────────────────────────────────────────
 export const conciliacionesAPI = {
   crear: (body) => request('/conciliaciones', { method: 'POST', body: JSON.stringify(body) }),
+  batch: (body) => request('/conciliaciones/batch', { method: 'POST', body: JSON.stringify(body) }),
   revertir: (id) => request(`/conciliaciones/${id}`, { method: 'DELETE' }),
   list: (params = {}) => {
     const q = new URLSearchParams(params).toString();

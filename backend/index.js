@@ -75,11 +75,11 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       return res.json({ success: true, data: existente, message: 'Este documento ya existe y no está anulado.' });
     }
 
-    // ─── PASO 1: IA Multimodal con MiniCPM-V (antes de subir a storage) ─────
+    // ─── PASO 1: IA Multimodal (ANTES de tocar storage) ────────────────────
     console.log('🤖 Analizando imagen con MiniCPM-V...');
     const prompt = `
       Eres una herramienta de extracción OCR estricta. Transcribe EXACTAMENTE lo que ves en la imagen. NO inventes palabras, no intentes hacer cálculos ni transformes formatos. Responde ÚNICAMENTE con un JSON válido, sin bloques de código ni texto adicional.
-
+      
       Utiliza estrictamente esta estructura y sigue el ejemplo de lo que debes buscar:
       {
         "beneficiario": "El nombre literal junto a 'Pago a la orden de:' (Ej: 'José Fasselli')",
@@ -103,7 +103,9 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
           images: [imageBase64],
           stream: false,
           format: 'json',
-          options: { temperature: 0.0 }
+          options: {
+            temperature: 0.0 // Crucial: Temperatura 0 para evitar que la IA alucine ("invente" datos como 3000 o pesetas)
+          }
         }),
         signal: AbortSignal.timeout(60000),
       });
@@ -114,10 +116,12 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       }
 
       const aiData = await aiResponse.json();
+      // El modelo a veces envuelve el JSON en texto, lo extraemos.
       const jsonMatch = aiData.response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         datosEstructurados = JSON.parse(jsonMatch[0]);
       } else {
+        // Si no hay JSON, intentamos parsear la respuesta completa
         datosEstructurados = JSON.parse(aiData.response);
       }
       console.log('✅ Datos extraídos por MiniCPM-V:', datosEstructurados);
@@ -127,12 +131,21 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       return res.status(500).json({ error: `Error con el modelo MiniCPM-V: ${e.message}` });
     }
 
-    // ─── PASO 2: Validaciones y limpieza de datos (antes de tocar storage) ──
-    const matchNumero = String(datosEstructurados.monto || '0').match(/\d+[\d,.]*/);
-    let montoRaw = '0';
+    // Limpieza inteligente del campo monto para evitar bugs con "Q."
+    let montoRaw = String(datosEstructurados.monto || '0');
+    // Buscamos explícitamente el bloque de números (ej evita el punto inicial de "Q.")
+    // \d+ obliga a que empiece con un número, y luego agarra puntos, comas y más números
+    const matchNumero = montoRaw.match(/\d+[\d,.]*/);
     if (matchNumero) {
-      let n = matchNumero[0].replace(/[.,](?=\d{3}(?:[.,]|$))/g, '').replace(/,/g, '.');
-      montoRaw = n;
+      let numeroLimpio = matchNumero[0];
+      // El modelo a veces usa punto como separador de miles: "1.300.00".
+      // La regla humana: un punto o coma seguido de exactamente 3 cifras y luego otro separador (o final) es separador de miles.
+      numeroLimpio = numeroLimpio.replace(/[.,](?=\d{3}(?:[.,]|$))/g, '');
+      // Si quedó alguna coma funcionando como decimal (ej: "1300,50"), la pasamos a punto matemático estándar
+      numeroLimpio = numeroLimpio.replace(/,/g, '.');
+      montoRaw = numeroLimpio;
+    } else {
+      montoRaw = '0';
     }
     const montoFinal = parseFloat(montoRaw) || 0;
 
@@ -147,19 +160,27 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       else tipoParseado = 'otro';
     }
     const tipoDocumento = tipoParseado;
-
+    
+    // Convertir la fecha a formato de base de datos
     const fechaAnalizada = parseFechaOCR(datosEstructurados.fecha);
     if (!fechaAnalizada) {
       throw new Error(`La Inteligencia Artificial no pudo extraer o procesar una fecha del documento (Leyó: "${datosEstructurados.fecha}"). No se puede continuar sin el día de emisión.`);
     }
 
+    // Limpiar el número de documento: quitar ceros a la izquierda y truncar a 100 caracteres max para evitar crash
     let numeroDocLimpio = datosEstructurados.numero_documento ? String(datosEstructurados.numero_documento).trim() : null;
     if (numeroDocLimpio) {
-      numeroDocLimpio = numeroDocLimpio.replace(/^0+(?=\d)/, '').substring(0, 100);
+      numeroDocLimpio = numeroDocLimpio.replace(/^0+(?=\d)/, ''); // Quita los ceros a la izquierda
+      numeroDocLimpio = numeroDocLimpio.substring(0, 100);        // Trunca a 100 caracteres máximo
     }
 
-    let bancoLimpio = datosEstructurados.banco ? String(datosEstructurados.banco).trim().substring(0, 100) : null;
-
+    // Truncar también el banco por seguridad
+    let bancoLimpio = datosEstructurados.banco ? String(datosEstructurados.banco).trim() : null;
+    if (bancoLimpio) {
+      bancoLimpio = bancoLimpio.substring(0, 100);
+    }
+    
+    // ─── PASO 2: Validación de duplicados (ANTES de tocar storage) ─────────
     if (tipoDocumento === 'cheque' && numeroDocLimpio && bancoLimpio) {
       const dbMonto = montoFinal > 0 ? montoFinal : 1;
       const { data: existentes, error: errorBusqueda } = await supabase
@@ -169,6 +190,7 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
         .eq('numero_documento', numeroDocLimpio)
         .eq('banco', bancoLimpio)
         .eq('monto_inicial', dbMonto)
+        .not('estado', 'eq', 'borrador')
         .limit(1);
 
       if (!errorBusqueda && existentes && existentes.length > 0) {
@@ -176,7 +198,7 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       }
     }
 
-    // ─── PASO 3: Subir a Storage SOLO si todas las validaciones pasaron ──────
+    // ─── PASO 3: Subir a Storage SOLO si OCR + validaciones pasaron ─────────
     const fileName = `${Date.now()}_${originalFilename}`;
     const { error: storageError } = await supabase.storage
       .from('comprobantes')
@@ -187,7 +209,9 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
       .from('comprobantes')
       .getPublicUrl(fileName);
 
-    // ─── PASO 4: Guardar en BD — si falla, limpiar storage inmediatamente ───
+    // ─── PASO 4: Insertar en BD como BORRADOR — si falla, rollback storage ──
+    // Estado 'borrador': NO aparece como fondo disponible hasta que el usuario
+    // confirme los datos en el frontend. Si cancela, DELETE limpia BD + storage.
     const { data: dbData, error: dbError } = await supabase
       .from('metodos_pago')
       .insert([{
@@ -196,24 +220,24 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
         numero_documento: numeroDocLimpio,
         fecha_documento:  fechaAnalizada,
         monto_inicial:    montoFinal > 0 ? montoFinal : 1,
-        descripcion:      `Cheque para: ${datosEstructurados.beneficiario || 'N/A'}. Monto en letras: ${datosEstructurados.monto_en_letras || 'N/A'}`,
+        descripcion:      `${datosEstructurados.beneficiario || 'N/A'}. Monto en letras: ${datosEstructurados.monto_en_letras || 'N/A'}`,
         url_comprobante:  publicUrl,
         raw_ocr:          JSON.stringify(datosEstructurados),
         file_hash:        fileHash,
         origen:           'ocr_upload',
         usuario_creacion: correoUsuarioFinal,
+        estado:           'borrador',
       }])
       .select()
       .single();
 
     if (dbError) {
-      // Rollback: eliminar el archivo recién subido para no dejar huérfanos
       await supabase.storage.from('comprobantes').remove([fileName]);
       console.error('❌ Error en BD, archivo de storage eliminado:', fileName);
       throw dbError;
     }
 
-    console.log('✅ Proceso OCR exitoso → guardado en metodos_pago');
+    console.log('✅ OCR exitoso → guardado como BORRADOR (pendiente confirmación del usuario)');
     res.json({ success: true, data: dbData });
 
   } catch (error) {

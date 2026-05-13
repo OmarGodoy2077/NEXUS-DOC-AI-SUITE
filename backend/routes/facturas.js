@@ -37,6 +37,70 @@ module.exports = (supabase) => {
     }
   });
 
+  // GET /api/facturas/reporte/control-pagos — todas las facturas + conciliaciones para reporte del contador
+  // DEBE ir antes de /:id para evitar que Express capture 'reporte' como un id
+  router.get('/reporte/control-pagos', async (req, res) => {
+    try {
+      const { desde, hasta, estado, origen } = req.query;
+
+      let fQuery = supabase
+        .from('facturas')
+        .select('*')
+        .order('fecha_emision', { ascending: false });
+
+      if (desde)  fQuery = fQuery.gte('fecha_emision', desde);
+      if (hasta)  fQuery = fQuery.lte('fecha_emision', hasta);
+      if (estado) fQuery = fQuery.eq('estado', estado);
+      if (origen) fQuery = fQuery.eq('origen', origen);
+
+      const { data: facturas, error: fErr } = await fQuery;
+      if (fErr) throw fErr;
+
+      if (!facturas.length) return res.json({ facturas: [], conciliaciones: [] });
+
+      const facturaIds = facturas.map(f => f.id);
+
+      const { data: conciliaciones, error: cErr } = await supabase
+        .from('v_conciliacion_detalle')
+        .select('factura_id, conciliacion_id, monto_aplicado, fecha_conciliacion, usuario_conciliacion, tipo_pago, banco, numero_cheque_o_referencia, fecha_pago, estado_pago')
+        .in('factura_id', facturaIds)
+        .not('conciliacion_id', 'is', null);
+
+      if (cErr) throw cErr;
+
+      res.json({ facturas, conciliaciones: conciliaciones || [] });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/facturas/reporte/resumen — métricas del dashboard
+  router.get('/reporte/resumen', async (req, res) => {
+    try {
+      const { desde, hasta } = req.query;
+
+      let query = supabase.from('facturas').select('estado, monto_total, monto_pagado, saldo_pendiente');
+      if (desde) query = query.gte('fecha_emision', desde);
+      if (hasta) query = query.lte('fecha_emision', hasta);
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      const resumen = data.reduce((acc, f) => {
+        acc.total++;
+        acc.monto_total     += Number(f.monto_total)     || 0;
+        acc.monto_pagado    += Number(f.monto_pagado)    || 0;
+        acc.saldo_pendiente += Number(f.saldo_pendiente) || 0;
+        acc[`estado_${f.estado}`] = (acc[`estado_${f.estado}`] || 0) + 1;
+        return acc;
+      }, { total: 0, monto_total: 0, monto_pagado: 0, saldo_pendiente: 0 });
+
+      res.json(resumen);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/facturas/:id — detalle con conciliaciones (drill-down)
   router.get('/:id', async (req, res) => {
     try {
@@ -47,7 +111,6 @@ module.exports = (supabase) => {
         .single();
       if (fErr) throw fErr;
 
-      // Cargar detalle de conciliaciones para el drill-down
       const { data: conciliaciones, error: cErr } = await supabase
         .from('v_conciliacion_detalle')
         .select('*')
@@ -93,33 +156,6 @@ module.exports = (supabase) => {
       res.json({ success: true, data });
     } catch (err) {
       res.status(400).json({ error: err.message });
-    }
-  });
-
-  // GET /api/facturas/reporte/resumen — métricas del dashboard
-  router.get('/reporte/resumen', async (req, res) => {
-    try {
-      const { desde, hasta } = req.query;
-
-      let query = supabase.from('facturas').select('estado, monto_total, monto_pagado, saldo_pendiente');
-      if (desde) query = query.gte('fecha_emision', desde);
-      if (hasta) query = query.lte('fecha_emision', hasta);
-
-      const { data, error } = await query;
-      if (error) throw error;
-
-      const resumen = data.reduce((acc, f) => {
-        acc.total++;
-        acc.monto_total   += Number(f.monto_total)   || 0;
-        acc.monto_pagado  += Number(f.monto_pagado)  || 0;
-        acc.saldo_pendiente += Number(f.saldo_pendiente) || 0;
-        acc[`estado_${f.estado}`] = (acc[`estado_${f.estado}`] || 0) + 1;
-        return acc;
-      }, { total: 0, monto_total: 0, monto_pagado: 0, saldo_pendiente: 0 });
-
-      res.json(resumen);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
     }
   });
 

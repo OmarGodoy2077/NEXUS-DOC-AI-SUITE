@@ -109,6 +109,39 @@ module.exports = (supabase) => {
     }
   });
 
+  // POST /api/metodos-pago/:id/confirmar — borrador → disponible (usuario aprueba los datos OCR)
+  router.post('/:id/confirmar', async (req, res) => {
+    try {
+      const { data: mPago, error: fetchErr } = await supabase
+        .from('metodos_pago')
+        .select('estado')
+        .eq('id', req.params.id)
+        .single();
+
+      if (fetchErr || !mPago) return res.status(404).json({ error: 'Registro no encontrado' });
+      if (mPago.estado !== 'borrador') {
+        return res.status(400).json({ error: 'Solo se puede confirmar un registro en estado borrador' });
+      }
+
+      // Aplicar los campos editados que el usuario haya corregido + cambiar estado a disponible
+      const camposPermitidos = ['tipo', 'banco', 'numero_documento', 'fecha_documento', 'monto_inicial', 'descripcion'];
+      const payload = { estado: 'disponible' };
+      camposPermitidos.forEach(c => { if (req.body[c] !== undefined) payload[c] = req.body[c]; });
+
+      const { data, error } = await supabase
+        .from('metodos_pago')
+        .update(payload)
+        .eq('id', req.params.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ success: true, data });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
   // POST /api/metodos-pago/:id/anular
   router.post('/:id/anular', async (req, res) => {
     try {
@@ -148,8 +181,8 @@ module.exports = (supabase) => {
 
       if (fetchErr) throw fetchErr;
 
-      if (mPago.estado !== 'anulado') {
-        return res.status(400).json({ error: 'Solo se pueden eliminar permanentemente métodos de pago en estado ANULADO.' });
+      if (!['anulado', 'borrador'].includes(mPago.estado)) {
+        return res.status(400).json({ error: 'Solo se pueden eliminar registros en estado ANULADO o BORRADOR.' });
       }
 
       // Eliminar archivo de storage si existe

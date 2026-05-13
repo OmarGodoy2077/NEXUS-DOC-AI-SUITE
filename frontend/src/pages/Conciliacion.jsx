@@ -1,5 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Link2, RefreshCw, CheckCircle2, AlertCircle, ArrowRight, Search, Trash2, Zap, Target } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  Link2, RefreshCw, CheckCircle2, ArrowRight, Search, Trash2,
+  Zap, Target, Filter, ChevronDown, ChevronUp, History, X,
+  SortAsc, SortDesc, SquareCheck, Square,
+} from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
@@ -9,40 +13,59 @@ import { conciliacionesAPI, pagosAPI, facturasAPI } from '../services/api';
 import { useApp } from '../context/AppContext';
 
 const Q = (n) => `Q ${Number(n || 0).toLocaleString('es-GT', { minimumFractionDigits: 2 })}`;
+const fmt = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString('es-GT') : '—';
+
+const SORT_OPTIONS = [
+  { key: 'fecha_emision_desc', label: 'Fecha ↓' },
+  { key: 'fecha_emision_asc',  label: 'Fecha ↑' },
+  { key: 'saldo_desc',         label: 'Pendiente ↓' },
+  { key: 'saldo_asc',         label: 'Pendiente ↑' },
+  { key: 'emisor_asc',         label: 'Emisor A–Z' },
+];
 
 export function Conciliacion() {
   const { user, showNotification } = useApp();
   const curYear = new Date().getFullYear();
 
-  // Filtros del período
+  // ── Período ──────────────────────────────────────────────────
   const [year, setYear]   = useState(String(curYear));
   const [month, setMonth] = useState('');
-  const [busqueda, setBusqueda] = useState('');
 
-  // Datos
+  // ── Filtros facturas ─────────────────────────────────────────
+  const [busqueda,    setBusqueda]    = useState('');
+  const [filtroEmisores, setFiltroEmisores] = useState('');  // texto libre
+  const [filtroEstado,   setFiltroEstado]   = useState('');  // pendiente | parcial | ''
+  const [sortKey,        setSortKey]        = useState('fecha_emision_desc');
+  const [filtrosOpen,    setFiltrosOpen]    = useState(false);
+
+  // ── Datos ─────────────────────────────────────────────────────
   const [facturasPendientes, setFacturasPendientes] = useState([]);
   const [pagosDisponibles,   setPagosDisponibles]   = useState([]);
   const [historial,          setHistorial]          = useState([]);
   const [loadingFacturas,    setLoadingFacturas]    = useState(true);
   const [loadingPagos,       setLoadingPagos]       = useState(true);
-  const [loadingHistorial,   setLoadingHistorial]   = useState(true);
+  const [loadingHistorial,   setLoadingHistorial]   = useState(false);
+  const [historialOpen,      setHistorialOpen]      = useState(false);
 
-  // Estado del formulario de vinculación
-  const [facturaSeleccionada, setFacturaSeleccionada] = useState(null);
-  const [pagoSeleccionado,    setPagoSeleccionado]    = useState(null);
-  const [montoAplicar,        setMontoAplicar]        = useState('');
-  const [notas,               setNotas]               = useState('');
-  const [vinculando,          setVinculando]          = useState(false);
-  const [confirmOpen,         setConfirmOpen]         = useState(false);
+  // ── Selección múltiple de facturas ───────────────────────────
+  const [seleccionadas,   setSeleccionadas]   = useState(new Set());   // Set<id>
+  const [pagoSeleccionado, setPagoSeleccionado] = useState(null);
+  const [montoAplicar,   setMontoAplicar]     = useState('');
+  const [notas,          setNotas]            = useState('');
+  const [vinculando,     setVinculando]       = useState(false);
+  const [confirmOpen,    setConfirmOpen]      = useState(false);
 
+  // ── Carga de datos ────────────────────────────────────────────
   const loadFacturas = useCallback(async () => {
     setLoadingFacturas(true);
     try {
       const { desde, hasta } = periodoToRange(year, month);
-      const params = { desde, hasta, estados: 'pendiente,parcial', limit: 100, page: 1 };
+      const params = { desde, hasta, estados: 'pendiente,parcial', limit: 200, page: 1 };
       if (busqueda) params.busqueda = busqueda;
       const res = await facturasAPI.list(params);
       setFacturasPendientes(res.data || []);
+      // Limpiar selección al recargar
+      setSeleccionadas(new Set());
     } finally {
       setLoadingFacturas(false);
     }
@@ -63,7 +86,7 @@ export function Conciliacion() {
     try {
       const { desde, hasta } = periodoToRange(year, month);
       const res = await conciliacionesAPI.reporte({ desde, hasta });
-      setHistorial((res.data || []).filter(r => r.conciliacion_id).slice(0, 50));
+      setHistorial((res.data || []).filter(r => r.conciliacion_id));
     } finally {
       setLoadingHistorial(false);
     }
@@ -71,20 +94,97 @@ export function Conciliacion() {
 
   useEffect(() => { loadFacturas(); }, [loadFacturas]);
   useEffect(() => { loadPagos(); }, [loadPagos]);
-  useEffect(() => { loadHistorial(); }, [loadHistorial]);
 
-  // Sugerir monto automáticamente al seleccionar ambos
+  // Cargar historial solo cuando el panel está abierto
   useEffect(() => {
-    if (!facturaSeleccionada || !pagoSeleccionado) return;
-    const max = Math.min(Number(facturaSeleccionada.saldo_pendiente), Number(pagoSeleccionado.saldo_disponible));
-    setMontoAplicar(max.toFixed(2));
-  }, [facturaSeleccionada, pagoSeleccionado]);
+    if (historialOpen) loadHistorial();
+  }, [historialOpen, loadHistorial]);
 
-  const handleVincular = async () => {
-    const monto = Number(montoAplicar);
-    if (!facturaSeleccionada) { showNotification('Selecciona una factura', 'error'); return; }
+  // ── Filtrado + ordenamiento local (sin hit extra al servidor) ─
+  const facturasFiltradas = useMemo(() => {
+    let lista = [...facturasPendientes];
+
+    if (filtroEmisores.trim()) {
+      const term = filtroEmisores.toLowerCase();
+      lista = lista.filter(f =>
+        (f.nombre_emisor || '').toLowerCase().includes(term) ||
+        (f.nit_emisor    || '').toLowerCase().includes(term)
+      );
+    }
+
+    if (filtroEstado) {
+      lista = lista.filter(f => f.estado === filtroEstado);
+    }
+
+    // Ordenamiento
+    lista.sort((a, b) => {
+      switch (sortKey) {
+        case 'fecha_emision_asc':  return new Date(a.fecha_emision) - new Date(b.fecha_emision);
+        case 'fecha_emision_desc': return new Date(b.fecha_emision) - new Date(a.fecha_emision);
+        case 'saldo_desc':         return Number(b.saldo_pendiente) - Number(a.saldo_pendiente);
+        case 'saldo_asc':          return Number(a.saldo_pendiente) - Number(b.saldo_pendiente);
+        case 'emisor_asc':         return (a.nombre_emisor || '').localeCompare(b.nombre_emisor || '');
+        default:                   return 0;
+      }
+    });
+
+    return lista;
+  }, [facturasPendientes, filtroEmisores, filtroEstado, sortKey]);
+
+  // ── Emisores únicos para el filtro de autocomplete ───────────
+  const emisoresUnicos = useMemo(() => {
+    const set = new Set(facturasPendientes.map(f => f.nombre_emisor).filter(Boolean));
+    return [...set].sort();
+  }, [facturasPendientes]);
+
+  // ── Totales de selección ─────────────────────────────────────
+  const facturasSeleccionadas = useMemo(
+    () => facturasFiltradas.filter(f => seleccionadas.has(f.id)),
+    [facturasFiltradas, seleccionadas]
+  );
+
+  const totalPendienteSeleccion = useMemo(
+    () => facturasSeleccionadas.reduce((acc, f) => acc + Number(f.saldo_pendiente || 0), 0),
+    [facturasSeleccionadas]
+  );
+
+  const saldoPago  = pagoSeleccionado ? Number(pagoSeleccionado.saldo_disponible) : 0;
+
+  // Monto sugerido: mínimo entre lo que cubre todas las facturas y lo que tiene el pago
+  useEffect(() => {
+    if (!seleccionadas.size || !pagoSeleccionado) { setMontoAplicar(''); return; }
+    const sugerido = Math.min(totalPendienteSeleccion, saldoPago);
+    setMontoAplicar(sugerido.toFixed(2));
+  }, [seleccionadas, pagoSeleccionado, totalPendienteSeleccion, saldoPago]);
+
+  // ── Helpers selección ─────────────────────────────────────────
+  const toggleFactura = (id) => {
+    setSeleccionadas(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    if (seleccionadas.size === facturasFiltradas.length) {
+      setSeleccionadas(new Set());
+    } else {
+      setSeleccionadas(new Set(facturasFiltradas.map(f => f.id)));
+    }
+  };
+
+  const clearSeleccion = () => setSeleccionadas(new Set());
+
+  // ── Lógica de vinculación ─────────────────────────────────────
+  const montoNum    = Number(montoAplicar) || 0;
+  const maxMonto    = Math.min(totalPendienteSeleccion, saldoPago);
+  const montoValido = montoNum > 0 && montoNum <= maxMonto + 0.001; // +epsilon por decimales
+
+  const handleVincular = () => {
+    if (!seleccionadas.size)  { showNotification('Selecciona al menos una factura', 'error'); return; }
     if (!pagoSeleccionado)    { showNotification('Selecciona un método de pago', 'error'); return; }
-    if (!monto || monto <= 0) { showNotification('Ingresa un monto válido', 'error'); return; }
+    if (!montoValido)         { showNotification('Monto inválido o excede el disponible', 'error'); return; }
     setConfirmOpen(true);
   };
 
@@ -92,20 +192,41 @@ export function Conciliacion() {
     setVinculando(true);
     setConfirmOpen(false);
     try {
-      await conciliacionesAPI.crear({
-        factura_id:        facturaSeleccionada.id,
-        metodo_pago_id:    pagoSeleccionado.id,
-        monto_aplicado:    Number(montoAplicar),
-        fecha_conciliacion: new Date().toISOString().split('T')[0],
-        usuario_email:     user.email,
-        notas,
-      });
-      showNotification('Conciliación registrada correctamente');
-      setFacturaSeleccionada(null);
+      const facturaIds = facturasSeleccionadas.map(f => f.id);
+
+      if (facturaIds.length === 1) {
+        // Flujo simple — endpoint original
+        await conciliacionesAPI.crear({
+          factura_id:         facturaIds[0],
+          metodo_pago_id:     pagoSeleccionado.id,
+          monto_aplicado:     montoNum,
+          fecha_conciliacion: new Date().toISOString().split('T')[0],
+          usuario_email:      user.email,
+          notas,
+        });
+      } else {
+        // Flujo multi — endpoint batch (distribuye automáticamente)
+        await conciliacionesAPI.batch({
+          factura_ids:        facturaIds,
+          metodo_pago_id:     pagoSeleccionado.id,
+          fecha_conciliacion: new Date().toISOString().split('T')[0],
+          usuario_email:      user.email,
+          notas,
+        });
+      }
+
+      showNotification(
+        facturaIds.length === 1
+          ? 'Conciliación registrada correctamente'
+          : `${facturaIds.length} facturas conciliadas correctamente`
+      );
+
+      setSeleccionadas(new Set());
       setPagoSeleccionado(null);
       setMontoAplicar('');
       setNotas('');
-      await Promise.all([loadFacturas(), loadPagos(), loadHistorial()]);
+      await Promise.all([loadFacturas(), loadPagos()]);
+      if (historialOpen) loadHistorial();
     } catch (e) {
       showNotification(e.message, 'error');
     } finally {
@@ -118,144 +239,323 @@ export function Conciliacion() {
     try {
       await conciliacionesAPI.revertir(conciliacion_id);
       showNotification('Conciliación revertida');
-      await Promise.all([loadFacturas(), loadPagos(), loadHistorial()]);
+      await Promise.all([loadFacturas(), loadPagos()]);
+      if (historialOpen) loadHistorial();
     } catch (e) {
       showNotification(e.message, 'error');
     }
   };
 
-  const saldoFact  = facturaSeleccionada ? Number(facturaSeleccionada.saldo_pendiente)  : 0;
-  const saldoPago  = pagoSeleccionado    ? Number(pagoSeleccionado.saldo_disponible)     : 0;
-  const maxMonto   = Math.min(saldoFact, saldoPago);
-  const montoNum   = Number(montoAplicar) || 0;
-  const montoValido = montoNum > 0 && montoNum <= maxMonto;
-
-  const select = 'bg-apple-bg border border-apple-border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text';
+  const inputCls = 'bg-apple-bg border border-apple-border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text';
+  const allSelected = facturasFiltradas.length > 0 && seleccionadas.size === facturasFiltradas.length;
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="space-y-5">
+
+      {/* ── Header ─────────────────────────────────────────────── */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-apple-text">Conciliación de Pagos</h1>
           <p className="text-sm text-apple-textSecondary mt-0.5">Vincula facturas pendientes con fondos disponibles</p>
         </div>
-        <PeriodFilter year={year} month={month} onYearChange={setYear} onMonthChange={setMonth} />
+        <div className="flex items-center gap-2 flex-wrap">
+          <PeriodFilter year={year} month={month} onYearChange={setYear} onMonthChange={setMonth} />
+          <Button
+            variant="outline" size="sm"
+            className={`gap-1.5 ${historialOpen ? 'border-apple-accent text-apple-accent' : ''}`}
+            onClick={() => setHistorialOpen(v => !v)}
+          >
+            <History size={14} />
+            Historial
+            {historialOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => { loadFacturas(); loadPagos(); }} className="gap-1.5">
+            <RefreshCw size={14} /> Actualizar
+          </Button>
+        </div>
       </div>
 
-      {/* Workspace de conciliación — 3 columnas */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      {/* ── Workspace 3 columnas ────────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1fr] gap-4 items-start">
 
-        {/* Col 1: Facturas pendientes */}
+        {/* ── Col 1: Facturas pendientes ──────────────────────── */}
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <p className="text-sm font-medium text-apple-text">Facturas Pendientes / Parciales</p>
-            <span className="text-xs text-apple-textSecondary bg-apple-bgSecondary px-2 py-0.5 rounded-full">{facturasPendientes.length}</span>
+            <p className="text-sm font-medium text-apple-text">
+              Facturas Pendientes / Parciales
+              <span className="ml-2 text-xs text-apple-textSecondary bg-apple-bgSecondary px-2 py-0.5 rounded-full">{facturasFiltradas.length}</span>
+            </p>
+            {seleccionadas.size > 0 && (
+              <button onClick={clearSeleccion} className="flex items-center gap-1 text-xs text-apple-textSecondary hover:text-apple-error transition-apple">
+                <X size={12} /> Limpiar ({seleccionadas.size})
+              </button>
+            )}
           </div>
+
+          {/* Búsqueda principal */}
           <div className="relative">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-apple-textSecondary" />
-            <input className={`${select} w-full pl-8`} placeholder="Buscar..." value={busqueda} onChange={e => setBusqueda(e.target.value)} />
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-apple-textSecondary pointer-events-none" />
+            <input
+              className={`${inputCls} w-full pl-8`}
+              placeholder="Buscar por emisor, NIT, UUID..."
+              value={busqueda}
+              onChange={e => setBusqueda(e.target.value)}
+            />
           </div>
-          <div className="space-y-2 max-h-[480px] overflow-y-auto pr-1">
-            {loadingFacturas ? <Spinner /> : facturasPendientes.length === 0 ? (
-              <EmptyState msg="Sin facturas pendientes en el período" />
-            ) : facturasPendientes.map(f => (
-              <SelectableCard
-                key={f.id}
-                selected={facturaSeleccionada?.id === f.id}
-                onClick={() => setFacturaSeleccionada(f)}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-medium text-apple-text truncate">{f.nombre_emisor || '—'}</p>
-                    <p className="text-xs text-apple-textSecondary truncate">{f.nombre_receptor || '—'}</p>
-                    <p className="text-xs text-apple-textSecondary mt-0.5">
-                      {f.fecha_emision ? new Date(f.fecha_emision).toLocaleDateString('es-GT') : '—'}
-                    </p>
+
+          {/* Panel de filtros avanzados */}
+          <div>
+            <button
+              onClick={() => setFiltrosOpen(v => !v)}
+              className="flex items-center gap-1.5 text-xs text-apple-textSecondary hover:text-apple-text transition-apple"
+            >
+              <Filter size={12} />
+              Filtros avanzados
+              {filtrosOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              {(filtroEmisores || filtroEstado || sortKey !== 'fecha_emision_desc') && (
+                <span className="ml-1 w-1.5 h-1.5 rounded-full bg-apple-accent inline-block" />
+              )}
+            </button>
+
+            {filtrosOpen && (
+              <div className="mt-2 space-y-2 p-3 bg-apple-bgSecondary rounded-apple border border-apple-border">
+                {/* Filtro por emisor */}
+                <div>
+                  <label className="text-xs text-apple-textSecondary block mb-1">Emisor / Proveedor</label>
+                  <input
+                    list="emisores-list"
+                    className={`${inputCls} w-full`}
+                    placeholder="Filtrar por emisor..."
+                    value={filtroEmisores}
+                    onChange={e => setFiltroEmisores(e.target.value)}
+                  />
+                  <datalist id="emisores-list">
+                    {emisoresUnicos.map(e => <option key={e} value={e} />)}
+                  </datalist>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Filtro estado */}
+                  <div>
+                    <label className="text-xs text-apple-textSecondary block mb-1">Estado</label>
+                    <select className={`${inputCls} w-full`} value={filtroEstado} onChange={e => setFiltroEstado(e.target.value)}>
+                      <option value="">Todos</option>
+                      <option value="pendiente">Pendiente</option>
+                      <option value="parcial">Parcial</option>
+                    </select>
                   </div>
-                  <EstadoBadge estado={f.estado} />
+
+                  {/* Ordenamiento */}
+                  <div>
+                    <label className="text-xs text-apple-textSecondary block mb-1">Ordenar por</label>
+                    <select className={`${inputCls} w-full`} value={sortKey} onChange={e => setSortKey(e.target.value)}>
+                      {SORT_OPTIONS.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+                    </select>
+                  </div>
                 </div>
-                <div className="flex justify-between mt-2 text-xs">
-                  <span className="text-apple-textSecondary">Pendiente:</span>
-                  <span className="font-semibold tabular-nums text-apple-warning">{Q(f.saldo_pendiente)}</span>
+
+                {(filtroEmisores || filtroEstado || sortKey !== 'fecha_emision_desc') && (
+                  <button
+                    className="text-xs text-apple-accent hover:underline"
+                    onClick={() => { setFiltroEmisores(''); setFiltroEstado(''); setSortKey('fecha_emision_desc'); }}
+                  >
+                    Limpiar filtros
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Barra de selección total */}
+          {seleccionadas.size > 0 && (
+            <div className="flex items-center justify-between px-3 py-2 bg-apple-accent/10 border border-apple-accent/30 rounded-apple text-xs">
+              <span className="text-apple-accent font-medium">
+                {seleccionadas.size} factura{seleccionadas.size > 1 ? 's' : ''} · pendiente total: {' '}
+                <span className="font-bold">{Q(totalPendienteSeleccion)}</span>
+              </span>
+              {pagoSeleccionado && (
+                <span className={`font-medium ${totalPendienteSeleccion > saldoPago ? 'text-apple-warning' : 'text-apple-success'}`}>
+                  {totalPendienteSeleccion > saldoPago ? `Pago cubre parcialmente` : `Pago cubre todo`}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Lista de facturas con checkbox */}
+          <div className="space-y-1.5 max-h-[520px] overflow-y-auto pr-1">
+            {/* Fila seleccionar todo */}
+            {facturasFiltradas.length > 1 && (
+              <button
+                onClick={toggleAll}
+                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-apple-textSecondary hover:bg-apple-bgSecondary border border-transparent hover:border-apple-border transition-apple"
+              >
+                {allSelected
+                  ? <SquareCheck size={14} className="text-apple-accent shrink-0" />
+                  : <Square size={14} className="shrink-0" />}
+                {allSelected ? 'Deseleccionar todo' : `Seleccionar todo (${facturasFiltradas.length})`}
+              </button>
+            )}
+
+            {loadingFacturas ? <Spinner /> : facturasFiltradas.length === 0 ? (
+              <EmptyState msg="Sin facturas para los filtros seleccionados" />
+            ) : facturasFiltradas.map(f => {
+              const isSel = seleccionadas.has(f.id);
+              return (
+                <div
+                  key={f.id}
+                  onClick={() => toggleFactura(f.id)}
+                  className={`rounded-apple border p-3 cursor-pointer transition-apple flex gap-2.5 items-start ${
+                    isSel
+                      ? 'border-apple-accent bg-apple-accent/10 shadow-[0_0_0_1px_#2997FF]'
+                      : 'border-apple-border bg-apple-bgSecondary hover:border-apple-accent/30 hover:bg-apple-bgSecondary/80'
+                  }`}
+                >
+                  <div className="mt-0.5 shrink-0">
+                    {isSel
+                      ? <SquareCheck size={15} className="text-apple-accent" />
+                      : <Square size={15} className="text-apple-textSecondary" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-apple-text truncate">{f.nombre_emisor || '—'}</p>
+                        <p className="text-xs text-apple-textSecondary truncate">{f.nombre_receptor || '—'}</p>
+                        <p className="text-xs text-apple-textSecondary mt-0.5">
+                          {f.fecha_emision ? new Date(f.fecha_emision).toLocaleDateString('es-GT') : '—'}
+                        </p>
+                      </div>
+                      <EstadoBadge estado={f.estado} />
+                    </div>
+                    <div className="flex justify-between mt-2 text-xs">
+                      <span className="text-apple-textSecondary">Pendiente:</span>
+                      <span className="font-semibold tabular-nums text-apple-warning">{Q(f.saldo_pendiente)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-apple-textSecondary">Total:</span>
+                      <span className="tabular-nums">{Q(f.monto_total)}</span>
+                    </div>
+                  </div>
                 </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-apple-textSecondary">Total:</span>
-                  <span className="tabular-nums">{Q(f.monto_total)}</span>
-                </div>
-              </SelectableCard>
-            ))}
+              );
+            })}
           </div>
         </div>
 
-        {/* Col 2: Panel central de vinculación */}
-        <div className="space-y-3">
+        {/* ── Col central: Panel de vinculación ──────────────── */}
+        <div className="lg:w-72 space-y-3">
           <p className="text-sm font-medium text-apple-text text-center">Vincular</p>
 
-          <Card className={`p-4 border-2 transition-apple ${facturaSeleccionada ? 'border-apple-accent/40 bg-apple-accent/5' : 'border-dashed border-apple-border'}`}>
-            <p className="text-xs text-apple-textSecondary mb-2">Factura seleccionada</p>
-            {facturaSeleccionada ? (
+          {/* Resumen facturas seleccionadas */}
+          <Card className={`p-4 border-2 transition-apple ${seleccionadas.size ? 'border-apple-accent/40 bg-apple-accent/5' : 'border-dashed border-apple-border'}`}>
+            <p className="text-xs text-apple-textSecondary mb-2">
+              {seleccionadas.size > 1 ? `${seleccionadas.size} facturas seleccionadas` : 'Factura seleccionada'}
+            </p>
+            {seleccionadas.size > 0 ? (
               <div className="space-y-1">
-                <p className="text-sm font-medium text-apple-text truncate">{facturaSeleccionada.nombre_emisor}</p>
-                <p className="text-xs text-apple-textSecondary">Pendiente: <span className="text-apple-warning font-semibold">{Q(facturaSeleccionada.saldo_pendiente)}</span></p>
+                {seleccionadas.size === 1 ? (
+                  <p className="text-sm font-medium text-apple-text truncate">
+                    {facturasSeleccionadas[0]?.nombre_emisor}
+                  </p>
+                ) : (
+                  <div className="space-y-0.5 max-h-24 overflow-y-auto">
+                    {facturasSeleccionadas.map(f => (
+                      <p key={f.id} className="text-xs text-apple-textSecondary truncate">· {f.nombre_emisor}</p>
+                    ))}
+                  </div>
+                )}
+                <p className="text-xs text-apple-textSecondary pt-1">
+                  Total pendiente:{' '}
+                  <span className="text-apple-warning font-semibold">{Q(totalPendienteSeleccion)}</span>
+                </p>
               </div>
-            ) : <p className="text-xs text-apple-textSecondary italic">← Selecciona una factura</p>}
+            ) : (
+              <p className="text-xs text-apple-textSecondary italic">← Selecciona una o varias facturas</p>
+            )}
           </Card>
 
-          <div className="flex justify-center"><ArrowRight size={18} className="text-apple-textSecondary rotate-90 lg:rotate-0" /></div>
+          <div className="flex justify-center">
+            <ArrowRight size={18} className="text-apple-textSecondary rotate-90 lg:rotate-0" />
+          </div>
 
+          {/* Método de pago seleccionado */}
           <Card className={`p-4 border-2 transition-apple ${pagoSeleccionado ? 'border-apple-success/40 bg-apple-success/5' : 'border-dashed border-apple-border'}`}>
             <p className="text-xs text-apple-textSecondary mb-2">Método de pago seleccionado</p>
             {pagoSeleccionado ? (
               <div className="space-y-1">
-                <p className="text-sm font-medium text-apple-text capitalize">{pagoSeleccionado.tipo} {pagoSeleccionado.banco ? `— ${pagoSeleccionado.banco}` : ''}</p>
-                {pagoSeleccionado.numero_documento && <p className="text-xs text-apple-textSecondary">#{pagoSeleccionado.numero_documento}</p>}
-                <p className="text-xs text-apple-textSecondary">Disponible: <span className="text-apple-success font-semibold">{Q(pagoSeleccionado.saldo_disponible)}</span></p>
+                <p className="text-sm font-medium text-apple-text capitalize">
+                  {pagoSeleccionado.tipo}{pagoSeleccionado.banco ? ` — ${pagoSeleccionado.banco}` : ''}
+                </p>
+                {pagoSeleccionado.numero_documento && (
+                  <p className="text-xs text-apple-textSecondary">#{pagoSeleccionado.numero_documento}</p>
+                )}
+                <p className="text-xs text-apple-textSecondary">
+                  Disponible: <span className="text-apple-success font-semibold">{Q(pagoSeleccionado.saldo_disponible)}</span>
+                </p>
               </div>
-            ) : <p className="text-xs text-apple-textSecondary italic">→ Selecciona un pago</p>}
+            ) : (
+              <p className="text-xs text-apple-textSecondary italic">→ Selecciona un pago</p>
+            )}
           </Card>
 
-          {facturaSeleccionada && pagoSeleccionado && (
+          {/* Controles de monto y vinculación */}
+          {seleccionadas.size > 0 && pagoSeleccionado && (
             <div className="space-y-3 bg-apple-bgSecondary rounded-apple p-4 border border-apple-border">
-              {/* Quick-apply buttons */}
               <div className="grid grid-cols-2 gap-2">
                 <button
-                  onClick={() => setMontoAplicar(Math.min(saldoPago, saldoFact).toFixed(2))}
+                  onClick={() => setMontoAplicar(Math.min(saldoPago, totalPendienteSeleccion).toFixed(2))}
                   className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-apple-accent/40 bg-apple-accent/5 hover:bg-apple-accent/10 text-apple-accent text-xs font-medium transition-apple"
-                  title="Usar todo el saldo disponible del pago (hasta cubrir la factura)"
                 >
                   <Zap size={12} /> Todo el pago
                 </button>
                 <button
-                  onClick={() => saldoPago >= saldoFact && setMontoAplicar(saldoFact.toFixed(2))}
-                  disabled={saldoPago < saldoFact}
+                  onClick={() => saldoPago >= totalPendienteSeleccion && setMontoAplicar(totalPendienteSeleccion.toFixed(2))}
+                  disabled={saldoPago < totalPendienteSeleccion}
                   className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-apple-success/40 bg-apple-success/5 hover:bg-apple-success/10 text-apple-success text-xs font-medium transition-apple disabled:opacity-40 disabled:cursor-not-allowed"
-                  title={saldoPago < saldoFact ? `Pago insuficiente — faltan ${Q(saldoFact - saldoPago)}` : 'Cubrir el total pendiente de la factura'}
+                  title={saldoPago < totalPendienteSeleccion ? `Pago insuficiente — faltan ${Q(totalPendienteSeleccion - saldoPago)}` : 'Cubrir todo el pendiente seleccionado'}
                 >
-                  <Target size={12} /> Cubrir factura
+                  <Target size={12} /> Cubrir todo
                 </button>
               </div>
 
+              {seleccionadas.size > 1 && (
+                <p className="text-xs text-apple-textSecondary bg-apple-bg rounded-lg px-3 py-2 border border-apple-border">
+                  El saldo se distribuirá entre las {seleccionadas.size} facturas en el orden de selección, cubriendo cada una hasta agotarse.
+                </p>
+              )}
+
               <div>
                 <label className="text-xs text-apple-textSecondary block mb-1">
-                  Monto a aplicar (Q) — máx. {Q(maxMonto)}
+                  {seleccionadas.size === 1 ? `Monto a aplicar — máx. ${Q(maxMonto)}` : `Saldo disponible del pago`}
                 </label>
-                <input
-                  type="number" min="0.01" step="0.01" max={maxMonto}
-                  className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
-                  value={montoAplicar}
-                  onChange={e => setMontoAplicar(e.target.value)}
-                />
-                {montoAplicar && !montoValido && (
-                  <p className="text-xs text-apple-error mt-1">
-                    {montoNum > maxMonto ? `Excede el máximo (${Q(maxMonto)})` : 'Monto inválido'}
-                  </p>
+                {seleccionadas.size === 1 ? (
+                  <>
+                    <input
+                      type="number" min="0.01" step="0.01" max={maxMonto}
+                      className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
+                      value={montoAplicar}
+                      onChange={e => setMontoAplicar(e.target.value)}
+                    />
+                    {montoAplicar && !montoValido && (
+                      <p className="text-xs text-apple-error mt-1">
+                        {montoNum > maxMonto ? `Excede el máximo (${Q(maxMonto)})` : 'Monto inválido'}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-sm font-semibold text-apple-success tabular-nums">{Q(saldoPago)}</p>
                 )}
               </div>
+
               <div>
                 <label className="text-xs text-apple-textSecondary block mb-1">Notas (opcional)</label>
-                <input className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
-                  placeholder="Observaciones..." value={notas} onChange={e => setNotas(e.target.value)} />
+                <input
+                  className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
+                  placeholder="Observaciones..."
+                  value={notas}
+                  onChange={e => setNotas(e.target.value)}
+                />
               </div>
+
               <Button
                 className="w-full gap-2"
                 onClick={handleVincular}
@@ -263,128 +563,170 @@ export function Conciliacion() {
               >
                 {vinculando
                   ? <><RefreshCw size={14} className="animate-spin" /> Vinculando...</>
-                  : <><Link2 size={14} /> Registrar Conciliación</>}
+                  : <><Link2 size={14} />
+                      {seleccionadas.size === 1 ? 'Registrar Conciliación' : `Conciliar ${seleccionadas.size} facturas`}
+                    </>}
               </Button>
             </div>
           )}
 
-          {!facturaSeleccionada || !pagoSeleccionado ? (
-            <p className="text-xs text-apple-textSecondary text-center">Selecciona una factura y un pago para continuar</p>
-          ) : null}
+          {(!seleccionadas.size || !pagoSeleccionado) && (
+            <p className="text-xs text-apple-textSecondary text-center">
+              Selecciona facturas y un pago para continuar
+            </p>
+          )}
         </div>
 
-        {/* Col 3: Pagos disponibles */}
+        {/* ── Col 3: Pagos disponibles ────────────────────────── */}
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <p className="text-sm font-medium text-apple-text">Fondos Disponibles</p>
-            <span className="text-xs text-apple-textSecondary bg-apple-bgSecondary px-2 py-0.5 rounded-full">{pagosDisponibles.length}</span>
+            <p className="text-sm font-medium text-apple-text">
+              Fondos Disponibles
+              <span className="ml-2 text-xs text-apple-textSecondary bg-apple-bgSecondary px-2 py-0.5 rounded-full">{pagosDisponibles.length}</span>
+            </p>
           </div>
-          <div className="space-y-2 max-h-[528px] overflow-y-auto pr-1">
+          <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
             {loadingPagos ? <Spinner /> : pagosDisponibles.length === 0 ? (
               <EmptyState msg="Sin fondos disponibles. Registra un cheque o transferencia." />
-            ) : pagosDisponibles.map(p => (
-              <SelectableCard
-                key={p.id}
-                selected={pagoSeleccionado?.id === p.id}
-                onClick={() => setPagoSeleccionado(p)}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-medium text-apple-text capitalize">{p.tipo}</p>
-                    {p.banco && <p className="text-xs text-apple-textSecondary">{p.banco}</p>}
-                    {p.numero_documento && <p className="text-xs text-apple-textSecondary">#{p.numero_documento}</p>}
-                    {!p.banco && !p.numero_documento && p.descripcion && (
-                      <p className="text-xs text-apple-textSecondary truncate">{p.descripcion}</p>
-                    )}
-                    <p className="text-xs text-apple-textSecondary">{p.fecha_documento ? new Date(p.fecha_documento + 'T12:00:00').toLocaleDateString('es-GT') : '—'}</p>
+            ) : pagosDisponibles.map(p => {
+              const isSel = pagoSeleccionado?.id === p.id;
+              return (
+                <div
+                  key={p.id}
+                  onClick={() => setPagoSeleccionado(isSel ? null : p)}
+                  className={`rounded-apple border p-3 cursor-pointer transition-apple ${
+                    isSel
+                      ? 'border-apple-success bg-apple-success/10 shadow-[0_0_0_1px_#32D74B]'
+                      : 'border-apple-border bg-apple-bgSecondary hover:border-apple-success/30 hover:bg-apple-bgSecondary/80'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-apple-text capitalize">{p.tipo}</p>
+                      {p.banco && <p className="text-xs text-apple-textSecondary">{p.banco}</p>}
+                      {p.numero_documento && <p className="text-xs text-apple-textSecondary">#{p.numero_documento}</p>}
+                      {!p.banco && !p.numero_documento && p.descripcion && (
+                        <p className="text-xs text-apple-textSecondary truncate">{p.descripcion}</p>
+                      )}
+                      <p className="text-xs text-apple-textSecondary">{fmt(p.fecha_documento)}</p>
+                    </div>
+                    <EstadoBadge estado={p.estado} />
                   </div>
-                  <EstadoBadge estado={p.estado} />
+                  <div className="flex justify-between mt-2 text-xs">
+                    <span className="text-apple-textSecondary">Disponible:</span>
+                    <span className="font-semibold tabular-nums text-apple-success">{Q(p.saldo_disponible)}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-apple-textSecondary">Original:</span>
+                    <span className="tabular-nums">{Q(p.monto_inicial)}</span>
+                  </div>
                 </div>
-                <div className="flex justify-between mt-2 text-xs">
-                  <span className="text-apple-textSecondary">Disponible:</span>
-                  <span className="font-semibold tabular-nums text-apple-success">{Q(p.saldo_disponible)}</span>
-                </div>
-                <div className="flex justify-between text-xs">
-                  <span className="text-apple-textSecondary">Original:</span>
-                  <span className="tabular-nums">{Q(p.monto_inicial)}</span>
-                </div>
-              </SelectableCard>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>
 
-      {/* Historial de conciliaciones del período */}
-      <Card className="p-0 overflow-hidden">
-        <div className="px-5 py-4 border-b border-apple-border">
-          <p className="text-sm font-medium text-apple-text">Historial de Conciliaciones</p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-apple-textSecondary text-xs border-b border-apple-border bg-apple-bgSecondary/40">
-                {['Factura (Emisor)', 'Tipo Pago', 'Banco / Ref.', 'Fecha', 'Monto Aplicado', 'Pendiente Restante', 'Usuario', ''].map(h => (
-                  <th key={h} className="px-4 py-3 text-left font-medium whitespace-nowrap">{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-apple-border/40">
-              {loadingHistorial ? (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-apple-textSecondary text-sm"><RefreshCw size={14} className="animate-spin inline mr-1" />Cargando...</td></tr>
-              ) : historial.length === 0 ? (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-apple-textSecondary text-sm">Sin conciliaciones en el período seleccionado</td></tr>
-              ) : historial.map(c => (
-                <tr key={c.conciliacion_id} className="hover:bg-apple-bgSecondary/50 transition-apple">
-                  <td className="px-4 py-3 max-w-[160px] truncate text-apple-text">{c.nombre_emisor || '—'}</td>
-                  <td className="px-4 py-3 capitalize text-apple-textSecondary">{c.tipo_pago || '—'}</td>
-                  <td className="px-4 py-3 text-apple-textSecondary text-xs">
-                    {c.banco || ''} {c.numero_cheque_o_referencia ? `#${c.numero_cheque_o_referencia}` : ''}
-                  </td>
-                  <td className="px-4 py-3 tabular-nums text-apple-textSecondary whitespace-nowrap">
-                    {c.fecha_conciliacion ? new Date(c.fecha_conciliacion + 'T12:00:00').toLocaleDateString('es-GT') : '—'}
-                  </td>
-                  <td className="px-4 py-3 tabular-nums font-semibold text-apple-success whitespace-nowrap">{Q(c.monto_aplicado)}</td>
-                  <td className="px-4 py-3 tabular-nums whitespace-nowrap">
-                    <span className={Number(c.saldo_pendiente) > 0 ? 'text-apple-warning' : 'text-apple-success'}>
-                      {Q(c.saldo_pendiente)}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-apple-textSecondary text-xs">{c.usuario_conciliacion}</td>
-                  <td className="px-4 py-3">
-                    <button
-                      onClick={() => handleRevertir(c.conciliacion_id)}
-                      className="p-1.5 rounded hover:bg-apple-error/10 text-apple-textSecondary hover:text-apple-error transition-apple"
-                      title="Revertir conciliación"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </td>
+      {/* ── Historial colapsable ─────────────────────────────── */}
+      {historialOpen && (
+        <Card className="p-0 overflow-hidden">
+          <div className="px-5 py-4 border-b border-apple-border flex items-center justify-between">
+            <p className="text-sm font-medium text-apple-text flex items-center gap-2">
+              <History size={15} className="text-apple-textSecondary" />
+              Historial de Conciliaciones
+              {historial.length > 0 && (
+                <span className="text-xs bg-apple-bgSecondary text-apple-textSecondary px-2 py-0.5 rounded-full">{historial.length}</span>
+              )}
+            </p>
+            <button onClick={() => setHistorialOpen(false)} className="p-1 rounded hover:bg-apple-bgSecondary text-apple-textSecondary hover:text-apple-text transition-apple">
+              <X size={15} />
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-apple-textSecondary text-xs border-b border-apple-border bg-apple-bgSecondary/40">
+                  {['Factura (Emisor)', 'Tipo Pago', 'Banco / Ref.', 'Fecha Conc.', 'Monto Aplicado', 'Pendiente Restante', 'Usuario', ''].map(h => (
+                    <th key={h} className="px-4 py-3 text-left font-medium whitespace-nowrap">{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+              </thead>
+              <tbody className="divide-y divide-apple-border/40">
+                {loadingHistorial ? (
+                  <tr><td colSpan={8} className="px-4 py-8 text-center text-apple-textSecondary text-sm">
+                    <RefreshCw size={14} className="animate-spin inline mr-1" />Cargando...
+                  </td></tr>
+                ) : historial.length === 0 ? (
+                  <tr><td colSpan={8} className="px-4 py-8 text-center text-apple-textSecondary text-sm">
+                    Sin conciliaciones en el período seleccionado
+                  </td></tr>
+                ) : historial.map(c => (
+                  <tr key={c.conciliacion_id} className="hover:bg-apple-bgSecondary/50 transition-apple">
+                    <td className="px-4 py-3 max-w-[160px] truncate text-apple-text">{c.nombre_emisor || '—'}</td>
+                    <td className="px-4 py-3 capitalize text-apple-textSecondary">{c.tipo_pago || '—'}</td>
+                    <td className="px-4 py-3 text-apple-textSecondary text-xs">
+                      {c.banco || ''}{c.numero_cheque_o_referencia ? ` #${c.numero_cheque_o_referencia}` : ''}
+                    </td>
+                    <td className="px-4 py-3 tabular-nums text-apple-textSecondary whitespace-nowrap">
+                      {c.fecha_conciliacion ? fmt(c.fecha_conciliacion) : '—'}
+                    </td>
+                    <td className="px-4 py-3 tabular-nums font-semibold text-apple-success whitespace-nowrap">{Q(c.monto_aplicado)}</td>
+                    <td className="px-4 py-3 tabular-nums whitespace-nowrap">
+                      <span className={Number(c.saldo_pendiente) > 0 ? 'text-apple-warning' : 'text-apple-success'}>
+                        {Q(c.saldo_pendiente)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-apple-textSecondary text-xs">{c.usuario_conciliacion}</td>
+                    <td className="px-4 py-3">
+                      <button
+                        onClick={() => handleRevertir(c.conciliacion_id)}
+                        className="p-1.5 rounded hover:bg-apple-error/10 text-apple-textSecondary hover:text-apple-error transition-apple"
+                        title="Revertir conciliación"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
 
-      {/* Modal de confirmación */}
+      {/* ── Modal de confirmación ────────────────────────────── */}
       <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} title="Confirmar Conciliación" width="max-w-md">
         <div className="space-y-4">
           <div className="bg-apple-bg border border-apple-border rounded-apple p-4 space-y-3 text-sm">
-            <Row label="Factura" value={facturaSeleccionada?.nombre_emisor} />
-            <Row label="Saldo pendiente factura" value={Q(facturaSeleccionada?.saldo_pendiente)} />
+            {seleccionadas.size === 1 ? (
+              <Row label="Factura" value={facturasSeleccionadas[0]?.nombre_emisor} />
+            ) : (
+              <div>
+                <span className="text-apple-textSecondary text-sm">{seleccionadas.size} facturas seleccionadas</span>
+                <div className="mt-1 space-y-0.5 max-h-28 overflow-y-auto">
+                  {facturasSeleccionadas.map(f => (
+                    <p key={f.id} className="text-xs text-apple-textSecondary pl-2">· {f.nombre_emisor} — {Q(f.saldo_pendiente)}</p>
+                  ))}
+                </div>
+              </div>
+            )}
+            <Row label="Total pendiente" value={Q(totalPendienteSeleccion)} />
             <Row label="Método de pago" value={`${pagoSeleccionado?.tipo} ${pagoSeleccionado?.banco || ''}`} />
             <Row label="Saldo disponible pago" value={Q(pagoSeleccionado?.saldo_disponible)} />
             <hr className="border-apple-border" />
-            <Row label="Monto a aplicar" value={Q(montoAplicar)} bold />
+            <Row label={seleccionadas.size === 1 ? 'Monto a aplicar' : 'Saldo a distribuir'} value={Q(seleccionadas.size === 1 ? montoAplicar : saldoPago)} bold />
             {notas && <Row label="Notas" value={notas} />}
           </div>
-          <p className="text-xs text-apple-textSecondary">
-            Los saldos de la factura y el método de pago se actualizarán automáticamente.
-          </p>
+          {seleccionadas.size > 1 && (
+            <p className="text-xs text-apple-textSecondary">
+              El saldo disponible del pago se distribuirá entre las {seleccionadas.size} facturas en orden de selección.
+            </p>
+          )}
           <div className="flex gap-2 justify-end">
             <Button variant="outline" onClick={() => setConfirmOpen(false)}>Cancelar</Button>
             <Button onClick={confirmarVinculacion} className="gap-1.5">
-              <CheckCircle2 size={14} /> Confirmar
+              <CheckCircle2 size={14} />
+              {seleccionadas.size === 1 ? 'Confirmar' : `Confirmar ${seleccionadas.size} facturas`}
             </Button>
           </div>
         </div>
@@ -393,27 +735,20 @@ export function Conciliacion() {
   );
 }
 
-function SelectableCard({ selected, onClick, children }) {
+function Spinner() {
   return (
-    <div
-      onClick={onClick}
-      className={`rounded-apple border p-3 cursor-pointer transition-apple ${
-        selected
-          ? 'border-apple-accent bg-apple-accent/10 shadow-[0_0_0_1px_#2997FF]'
-          : 'border-apple-border bg-apple-bgSecondary hover:border-apple-accent/30 hover:bg-apple-bgSecondary/80'
-      }`}
-    >
-      {children}
+    <div className="flex justify-center py-8 text-apple-textSecondary text-sm">
+      <RefreshCw size={16} className="animate-spin mr-2" />Cargando...
     </div>
   );
 }
 
-function Spinner() {
-  return <div className="flex justify-center py-8 text-apple-textSecondary text-sm"><RefreshCw size={16} className="animate-spin mr-2" />Cargando...</div>;
-}
-
 function EmptyState({ msg }) {
-  return <div className="text-center py-8 text-apple-textSecondary text-xs border border-dashed border-apple-border rounded-apple">{msg}</div>;
+  return (
+    <div className="text-center py-8 text-apple-textSecondary text-xs border border-dashed border-apple-border rounded-apple">
+      {msg}
+    </div>
+  );
 }
 
 function Row({ label, value, bold }) {

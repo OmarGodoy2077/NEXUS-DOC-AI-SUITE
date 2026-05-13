@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, Check, X } from 'lucide-react';
+import { Loader2, Check, X, AlertTriangle, Trash2 } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
+import { Modal } from '../components/ui/Modal';
 import { ImageCropper } from '../components/ImageCropper';
 import { useApp } from '../context/AppContext';
 import { api, pagosAPI } from '../services/api';
@@ -10,10 +11,12 @@ import { api, pagosAPI } from '../services/api';
 export function Upload() {
   const navigate = useNavigate();
   const { user, showNotification } = useApp();
-  const [isUploading, setIsUploading] = useState(false);
+  const [isUploading,   setIsUploading]   = useState(false);
   const [validationData, setValidationData] = useState(null);
-  const [previewImage, setPreviewImage] = useState(null);
-  const [isSaving, setIsSaving] = useState(false);
+  const [previewImage,  setPreviewImage]  = useState(null);
+  const [isSaving,      setIsSaving]      = useState(false);
+  const [isDiscarding,  setIsDiscarding]  = useState(false);
+  const [discardOpen,   setDiscardOpen]   = useState(false);
 
   const handleCropComplete = async ({ imageBase64, originalFilename }) => {
     if (!imageBase64) {
@@ -31,14 +34,13 @@ export function Upload() {
       });
 
       if (result.success) {
-        showNotification('Documento analizado. Verifica los datos.', 'success');
-        setValidationData(result.data); // result.data es el registro en metodos_pago
+        showNotification('Documento analizado. Verifica los datos antes de confirmar.', 'success');
+        setValidationData(result.data);
       } else {
         showNotification(result.message || result.error || 'Error al procesar el documento', 'error');
         setPreviewImage(null);
       }
     } catch (error) {
-      console.error('Error OCR:', error);
       showNotification(error.message || 'Error de conexión con el backend.', 'error');
       setPreviewImage(null);
     } finally {
@@ -53,34 +55,38 @@ export function Upload() {
   const saveValidatedData = async () => {
     setIsSaving(true);
     try {
-      await pagosAPI.update(validationData.id, {
-        tipo: validationData.tipo,
-        banco: validationData.banco,
+      // Confirma el borrador: aplica correcciones del usuario y pasa a 'disponible'
+      await pagosAPI.confirmar(validationData.id, {
+        tipo:             validationData.tipo,
+        banco:            validationData.banco,
         numero_documento: validationData.numero_documento,
-        fecha_documento: validationData.fecha_documento,
-        monto_inicial: validationData.monto_inicial,
-        descripcion: validationData.descripcion
+        fecha_documento:  validationData.fecha_documento,
+        monto_inicial:    validationData.monto_inicial,
+        descripcion:      validationData.descripcion,
       });
-      showNotification('Datos actualizados y validados correctamente', 'success');
+      showNotification('Documento confirmado y disponible para conciliar', 'success');
       navigate('/metodos-pago');
     } catch (error) {
-      showNotification(error.message || 'Error al actualizar el registro', 'error');
+      showNotification(error.message || 'Error al confirmar el registro', 'error');
     } finally {
       setIsSaving(false);
     }
   };
 
-  const discardAndCancel = async () => {
-    if (!confirm('¿Descartar este documento?')) return;
+  const confirmarDescarte = async () => {
+    setIsDiscarding(true);
     try {
-      // Intentamos anular/eliminar para limpiar la base de datos si ya se insertó
-      await pagosAPI.anular(validationData.id);
+      // El registro está en 'borrador' — DELETE acepta ese estado y limpia storage
       await pagosAPI.delete(validationData.id);
+      showNotification('Documento descartado y eliminado', 'success');
+      setDiscardOpen(false);
+      setValidationData(null);
+      setPreviewImage(null);
     } catch (e) {
-      console.warn('Error limpiando el registro cancelado', e);
+      showNotification('Error al eliminar el documento: ' + e.message, 'error');
+    } finally {
+      setIsDiscarding(false);
     }
-    setValidationData(null);
-    setPreviewImage(null);
   };
 
   const inputStyle = 'w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text disabled:opacity-50';
@@ -89,33 +95,40 @@ export function Upload() {
     <div className="max-w-6xl mx-auto mt-8">
       <h1 className="text-2xl font-semibold mb-2 text-apple-text">OCR — Procesamiento de Documentos</h1>
       <p className="text-sm text-apple-textSecondary mb-6">
-        Sube un comprobante, recorta el área importante y verifica los datos extraídos por la IA antes de finalizar.
+        Sube un comprobante, recorta el área importante y verifica los datos extraídos por la IA antes de confirmar.
       </p>
 
       {validationData ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Vista previa del documento recortado */}
+          {/* Vista previa */}
           <Card className="p-4 bg-apple-bgSecondary border border-apple-border flex flex-col">
             <h2 className="text-sm font-medium text-apple-textSecondary mb-4">Documento Recortado</h2>
             <div className="flex-1 rounded-lg overflow-hidden bg-apple-bg flex items-center justify-center p-2 border border-apple-border/50">
               <img src={previewImage} alt="Documento Recortado" className="max-w-full max-h-[500px] object-contain" />
             </div>
+            {/* Aviso de estado borrador */}
+            <div className="mt-3 flex items-start gap-2 px-3 py-2 bg-apple-warning/10 border border-apple-warning/30 rounded-lg">
+              <AlertTriangle size={14} className="text-apple-warning shrink-0 mt-0.5" />
+              <p className="text-xs text-apple-warning">
+                Este documento aún no está guardado. Confirma los datos o descártalo.
+              </p>
+            </div>
           </Card>
 
-          {/* Formulario de Validación */}
+          {/* Formulario de validación */}
           <Card className="p-6 bg-apple-bgSecondary border border-apple-border">
-            <h2 className="text-lg font-medium text-apple-text mb-4">Validar Datos Extraídos</h2>
-            <p className="text-xs text-apple-warning mb-6">
-              Revisa y corrige los datos si la IA cometió algún error al interpretar la imagen.
+            <h2 className="text-lg font-medium text-apple-text mb-1">Validar Datos Extraídos</h2>
+            <p className="text-xs text-apple-textSecondary mb-5">
+              Revisa y corrige si la IA cometió algún error antes de confirmar.
             </p>
 
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-apple-textSecondary mb-1">Tipo de Documento</label>
-                  <select 
+                  <select
                     className={inputStyle}
-                    value={validationData.tipo} 
+                    value={validationData.tipo}
                     onChange={e => handleUpdateField('tipo', e.target.value)}
                   >
                     {['cheque', 'transferencia', 'deposito', 'efectivo', 'anticipo', 'otro'].map(t => (
@@ -125,10 +138,10 @@ export function Upload() {
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-apple-textSecondary mb-1">Fecha</label>
-                  <input 
-                    type="date" 
-                    className={inputStyle} 
-                    value={validationData.fecha_documento || ''} 
+                  <input
+                    type="date"
+                    className={inputStyle}
+                    value={validationData.fecha_documento || ''}
                     onChange={e => handleUpdateField('fecha_documento', e.target.value)}
                   />
                 </div>
@@ -136,10 +149,10 @@ export function Upload() {
 
               <div>
                 <label className="block text-xs font-medium text-apple-textSecondary mb-1">Banco Emisor / Receptor</label>
-                <input 
-                  type="text" 
-                  className={inputStyle} 
-                  value={validationData.banco || ''} 
+                <input
+                  type="text"
+                  className={inputStyle}
+                  value={validationData.banco || ''}
                   onChange={e => handleUpdateField('banco', e.target.value)}
                   placeholder="Ej. Banco Industrial"
                 />
@@ -147,10 +160,10 @@ export function Upload() {
 
               <div>
                 <label className="block text-xs font-medium text-apple-textSecondary mb-1">Número de Referencia / Cheque</label>
-                <input 
-                  type="text" 
-                  className={inputStyle} 
-                  value={validationData.numero_documento || ''} 
+                <input
+                  type="text"
+                  className={inputStyle}
+                  value={validationData.numero_documento || ''}
                   onChange={e => handleUpdateField('numero_documento', e.target.value)}
                   placeholder="Ej. #00063470"
                 />
@@ -158,42 +171,42 @@ export function Upload() {
 
               <div>
                 <label className="block text-xs font-medium text-apple-textSecondary mb-1">Monto (Q)</label>
-                <input 
-                  type="number" 
+                <input
+                  type="number"
                   step="0.01"
-                  className={inputStyle} 
-                  value={validationData.monto_inicial || ''} 
+                  className={inputStyle}
+                  value={validationData.monto_inicial || ''}
                   onChange={e => handleUpdateField('monto_inicial', e.target.value)}
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-apple-textSecondary mb-1">Descripción / Beneficiario</label>
-                <textarea 
-                  className={`${inputStyle} resize-none`} 
+                <textarea
+                  className={`${inputStyle} resize-none`}
                   rows={3}
-                  value={validationData.descripcion || ''} 
+                  value={validationData.descripcion || ''}
                   onChange={e => handleUpdateField('descripcion', e.target.value)}
                 />
               </div>
 
               <div className="flex gap-3 pt-4 border-t border-apple-border">
-                <Button 
-                  variant="secondary" 
-                  className="flex-1" 
-                  onClick={discardAndCancel}
-                  disabled={isSaving}
+                <Button
+                  variant="outline"
+                  className="flex-1 gap-1.5 text-apple-error border-apple-error/40 hover:bg-apple-error/10"
+                  onClick={() => setDiscardOpen(true)}
+                  disabled={isSaving || isDiscarding}
                 >
-                  <X size={16} className="mr-2" /> Descartar
+                  <Trash2 size={14} /> Descartar
                 </Button>
-                <Button 
-                  variant="primary" 
-                  className="flex-1" 
+                <Button
+                  className="flex-1 gap-1.5"
                   onClick={saveValidatedData}
-                  disabled={isSaving}
+                  disabled={isSaving || isDiscarding}
                 >
-                  {isSaving ? <Loader2 size={16} className="animate-spin mr-2" /> : <Check size={16} className="mr-2" />}
-                  Confirmar y Guardar
+                  {isSaving
+                    ? <><Loader2 size={14} className="animate-spin" /> Guardando...</>
+                    : <><Check size={14} /> Confirmar y Guardar</>}
                 </Button>
               </div>
             </div>
@@ -204,18 +217,40 @@ export function Upload() {
           {isUploading ? (
             <div className="flex flex-col items-center justify-center h-64">
               <Loader2 size={48} className="animate-spin text-apple-accent" />
-              <h3 className="text-lg font-medium mt-4 text-apple-text">
-                La IA está analizando el documento...
-              </h3>
-              <p className="text-sm text-apple-textSecondary">
-                Esto puede tomar hasta un minuto.
-              </p>
+              <h3 className="text-lg font-medium mt-4 text-apple-text">La IA está analizando el documento...</h3>
+              <p className="text-sm text-apple-textSecondary">Esto puede tomar hasta un minuto.</p>
             </div>
           ) : (
             <ImageCropper onCropComplete={handleCropComplete} />
           )}
         </Card>
       )}
+
+      {/* Modal de confirmación de descarte */}
+      <Modal open={discardOpen} onClose={() => setDiscardOpen(false)} title="Descartar Documento" width="max-w-sm">
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 p-3 bg-apple-error/10 border border-apple-error/30 rounded-apple">
+            <AlertTriangle size={18} className="text-apple-error shrink-0 mt-0.5" />
+            <p className="text-sm text-apple-text">
+              Se eliminará permanentemente el registro y el archivo de comprobante. Esta acción no se puede deshacer.
+            </p>
+          </div>
+          <div className="flex gap-2 justify-end">
+            <Button variant="outline" onClick={() => setDiscardOpen(false)} disabled={isDiscarding}>
+              Cancelar
+            </Button>
+            <Button
+              className="gap-1.5 bg-apple-error hover:bg-apple-error/80 border-apple-error"
+              onClick={confirmarDescarte}
+              disabled={isDiscarding}
+            >
+              {isDiscarding
+                ? <><Loader2 size={14} className="animate-spin" /> Eliminando...</>
+                : <><Trash2 size={14} /> Sí, descartar</>}
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

@@ -20,7 +20,8 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
-  CREATE TYPE estado_metodo_pago AS ENUM ('disponible', 'utilizado_parcial', 'utilizado_total', 'anulado');
+  -- 'borrador': estado temporal tras OCR, antes de que el usuario confirme (migración 004)
+  CREATE TYPE estado_metodo_pago AS ENUM ('borrador', 'disponible', 'utilizado_parcial', 'utilizado_total', 'anulado');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -295,13 +296,14 @@ BEGIN
       v_saldo_usado, v_monto_inicial;
   END IF;
 
+  -- No sobrescribir registros en 'borrador' (aún no confirmados) ni 'anulado'
   UPDATE metodos_pago
   SET
     saldo_utilizado = v_saldo_usado,
     estado          = v_nuevo_estado,
     updated_at      = NOW()
   WHERE id = v_pago_id
-    AND estado != 'anulado';
+    AND estado NOT IN ('anulado', 'borrador');
 
   RETURN COALESCE(NEW, OLD);
 END;

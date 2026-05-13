@@ -90,6 +90,85 @@ module.exports = (supabase) => {
     }
   });
 
+  // POST /api/conciliaciones/batch — conciliar MÚLTIPLES facturas con UN método de pago
+  // El monto del pago se distribuye en orden de selección hasta agotar saldo.
+  router.post('/batch', async (req, res) => {
+    try {
+      const { factura_ids, metodo_pago_id, fecha_conciliacion, usuario_email, notas } = req.body;
+
+      if (!Array.isArray(factura_ids) || factura_ids.length === 0)
+        return res.status(400).json({ error: 'factura_ids debe ser un array no vacío' });
+      if (!metodo_pago_id)
+        return res.status(400).json({ error: 'metodo_pago_id es requerido' });
+
+      // Cargar método de pago
+      const { data: pago, error: pErr } = await supabase
+        .from('metodos_pago')
+        .select('id, estado, saldo_disponible')
+        .eq('id', metodo_pago_id)
+        .single();
+      if (pErr || !pago) return res.status(404).json({ error: 'Método de pago no encontrado' });
+      if (pago.estado === 'anulado')         return res.status(409).json({ error: 'El método de pago está anulado' });
+      if (pago.estado === 'utilizado_total') return res.status(409).json({ error: 'El método de pago no tiene saldo disponible' });
+
+      // Cargar todas las facturas seleccionadas
+      const { data: facturas, error: fErr } = await supabase
+        .from('facturas')
+        .select('id, nombre_emisor, estado, saldo_pendiente')
+        .in('id', factura_ids);
+      if (fErr) throw fErr;
+
+      // Validar que ninguna esté anulada o pagada
+      for (const f of facturas) {
+        if (f.estado === 'anulada') return res.status(409).json({ error: `Factura de "${f.nombre_emisor}" está anulada` });
+        if (f.estado === 'pagada')  return res.status(409).json({ error: `Factura de "${f.nombre_emisor}" ya está pagada` });
+      }
+
+      // Ordenar por el orden original que mandó el cliente (para respetar prioridad)
+      const facturaMap = Object.fromEntries(facturas.map(f => [f.id, f]));
+      const ordenadas  = factura_ids.map(id => facturaMap[id]).filter(Boolean);
+
+      // Distribuir saldo disponible entre las facturas en orden
+      let saldoRestante = Number(pago.saldo_disponible);
+      const conciliaciones = [];
+      const fechaConc = fecha_conciliacion || new Date().toISOString().split('T')[0];
+
+      for (const f of ordenadas) {
+        if (saldoRestante <= 0) break;
+        const pendiente = Number(f.saldo_pendiente);
+        if (pendiente <= 0) continue;
+        const montoAplicar = Math.min(saldoRestante, pendiente);
+
+        const { data: conc, error: cErr } = await supabase
+          .from('conciliaciones')
+          .insert([{
+            factura_id:          f.id,
+            metodo_pago_id,
+            monto_aplicado:      montoAplicar,
+            fecha_conciliacion:  fechaConc,
+            usuario_conciliacion: usuario_email || 'sistema',
+            notas: notas || null,
+          }])
+          .select()
+          .single();
+
+        if (cErr) throw cErr;
+        conciliaciones.push(conc);
+        saldoRestante -= montoAplicar;
+      }
+
+      res.status(201).json({
+        success: true,
+        total_conciliaciones: conciliaciones.length,
+        conciliaciones,
+        saldo_restante_pago: saldoRestante,
+      });
+    } catch (err) {
+      console.error('Error en conciliación batch:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // DELETE /api/conciliaciones/:id — revertir una conciliación
   router.delete('/:id', async (req, res) => {
     try {
