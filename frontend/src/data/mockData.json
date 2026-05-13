@@ -1,0 +1,43 @@
+{
+  "metrics": {
+    "documentsProcessed": 1247,
+    "tokensUsed": 45820,
+    "averageConfidence": "97.3%",
+    "monthlyCost": 1600.00,
+    "initialInvestment": 32825.00
+  },
+  "documents": [
+    {
+      "id": "DOC-001",
+      "type": "Factura",
+      "name": "Factura_Luz_Abril.pdf",
+      "status": "processed",
+      "confidence": 0.98,
+      "extractedData": { "emisor": "EEGSA", "monto": "Q 450.00", "fecha": "2026-04-15" },
+      "timestamp": "2026-04-28T10:00:00Z"
+    },
+    {
+      "id": "DOC-002",
+      "type": "Contrato",
+      "name": "Contrato_Arrendamiento.pdf",
+      "status": "processed",
+      "confidence": 0.95,
+      "extractedData": { "partes": "Luis Yuman vs Propiedades S.A.", "vigencia": "12 meses" },
+      "timestamp": "2026-04-27T15:30:00Z"
+    },
+    {
+      "id": "DOC-003",
+      "type": "Recibo",
+      "name": "Recibo_Muni_Jutiapa.pdf",
+      "status": "pending",
+      "confidence": 0,
+      "extractedData": {},
+      "timestamp": "2026-04-28T21:15:00Z"
+    }
+  ],
+  "recentActivity": [
+    { "id": 1, "action": "Documento procesado con Gemini Flash", "user": "Selvin Godoy", "time": "Hace 5 min" },
+    { "id": 2, "action": "Búsqueda semántica realizada", "user": "Cristopher Zepeda", "time": "Hace 12 min" },
+    { "id": 3, "action": "Nuevo nodo de almacenamiento Pinecone activo", "user": "System", "time": "Hace 45 min" }
+  ]
+}

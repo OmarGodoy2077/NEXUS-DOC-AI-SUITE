@@ -1,0 +1,12 @@
+# Credenciales — NUNCA subir
+.env
+.env.*
+
+# Dependencias
+node_modules/
+
+# Logs
+*.log
+
+# Scripts de uso único
+scripts/cleanup_storage.js
