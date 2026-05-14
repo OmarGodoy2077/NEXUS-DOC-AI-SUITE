@@ -185,11 +185,26 @@ module.exports = (supabase) => {
         return res.status(400).json({ error: 'Solo se pueden eliminar registros en estado ANULADO o BORRADOR.' });
       }
 
-      // Eliminar archivo de storage si existe
+      // Eliminar archivo de storage si existe.
+      // IMPORTANTE: getPublicUrl() devuelve la URL con URL-encoding (espacios → %20),
+      // pero el storage espera el nombre del archivo DECODIFICADO para borrar.
+      let storageDeleted = false;
+      let storageFileName = null;
       if (mPago.url_comprobante) {
-        const storageFileName = mPago.url_comprobante.split('/comprobantes/')[1];
-        if (storageFileName) {
-          await supabase.storage.from('comprobantes').remove([storageFileName]);
+        const rawName = mPago.url_comprobante.split('/comprobantes/')[1];
+        if (rawName) {
+          storageFileName = decodeURIComponent(rawName);
+          const { data: removed, error: storageErr } = await supabase.storage
+            .from('comprobantes')
+            .remove([storageFileName]);
+          if (storageErr) {
+            console.error('⚠️ Error eliminando archivo de storage:', storageErr.message);
+          } else if (removed && removed.length > 0) {
+            storageDeleted = true;
+            console.log('🗑️ Archivo eliminado de storage:', storageFileName);
+          } else {
+            console.warn('⚠️ Storage no encontró el archivo:', storageFileName);
+          }
         }
       }
 
@@ -200,7 +215,12 @@ module.exports = (supabase) => {
 
       if (delErr) throw delErr;
 
-      res.json({ success: true, message: 'Registro y archivo eliminados correctamente.' });
+      res.json({
+        success: true,
+        message: 'Registro eliminado correctamente.',
+        storage_file_deleted: storageDeleted,
+        storage_file_name: storageFileName,
+      });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }

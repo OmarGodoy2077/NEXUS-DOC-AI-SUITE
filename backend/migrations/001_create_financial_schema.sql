@@ -1,6 +1,15 @@
 -- ============================================================
--- NEXUS DOC AI SUITE — Migración 001
+-- NEXUS DOC AI SUITE — Migración 001 (consolidada)
 -- Schema Financiero: Conciliación y Control (Guatemala/SAT)
+--
+-- Incluye las migraciones posteriores ya integradas:
+--   002 — Importaciones Excel SAT
+--   003 — Agregado url_comprobante a v_conciliacion_detalle
+--   004 — Estado 'borrador' en metodos_pago + ajuste trigger
+--   005 — Auditoría de tokens de IA (tokens_prompt/respuesta/total + ocr_modelo)
+--   006 — Trigger soporta monto_total negativo (notas de crédito)
+--   007 — Estado 'nota_credito' en estado_factura
+--   008 — Trigger excluye NCRE del recálculo (estado permanente)
 -- ============================================================
 
 -- ─────────────────────────────────────────────
@@ -12,7 +21,9 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ENUMS
 -- ─────────────────────────────────────────────
 DO $$ BEGIN
-  CREATE TYPE estado_factura AS ENUM ('pendiente', 'parcial', 'pagada', 'anulada');
+  -- 'nota_credito': estado especial para NCRE (migración 007). No se concilia,
+  -- el monto va en negativo y se usa como ajuste al cuadrar facturas del mismo emisor.
+  CREATE TYPE estado_factura AS ENUM ('pendiente', 'parcial', 'pagada', 'anulada', 'nota_credito');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -121,6 +132,12 @@ CREATE TABLE IF NOT EXISTS metodos_pago (
   file_hash         TEXT,
   raw_ocr           TEXT,
 
+  -- Auditoría del modelo de IA usado (migración 005)
+  tokens_prompt     INTEGER,
+  tokens_respuesta  INTEGER,
+  tokens_total      INTEGER,
+  ocr_modelo        VARCHAR(60),
+
   -- Origen
   origen            origen_registro DEFAULT 'manual',
 
@@ -186,6 +203,25 @@ CREATE TABLE IF NOT EXISTS importaciones_excel (
 COMMENT ON TABLE importaciones_excel IS 'Registro de todas las importaciones de Excel de la Agencia Virtual SAT';
 
 -- ─────────────────────────────────────────────
+-- TABLA: transacciones (legacy — pre-refactor del sistema)
+-- Se mantiene para compatibilidad; el sistema actual usa metodos_pago.
+-- Las operaciones nuevas se registran en metodos_pago + conciliaciones.
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS transacciones (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, NOW()),
+  beneficiario      TEXT,
+  monto             DECIMAL(15,2),
+  fecha_documento   TEXT,
+  url_archivo       TEXT,
+  raw_ocr           TEXT,
+  file_hash         TEXT,
+  usuario_email     TEXT
+);
+
+COMMENT ON TABLE transacciones IS 'Tabla legacy del sistema anterior. Conservada para histórico — el flujo actual usa metodos_pago + conciliaciones.';
+
+-- ─────────────────────────────────────────────
 -- ÍNDICES DE PERFORMANCE
 -- ─────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_facturas_estado         ON facturas(estado);
@@ -214,6 +250,7 @@ DECLARE
   v_factura_id    UUID;
   v_monto_total   DECIMAL(15,2);
   v_monto_pagado  DECIMAL(15,2);
+  v_tipo_doc      tipo_documento_fiscal;
   v_nuevo_estado  estado_factura;
 BEGIN
   -- Determinar qué factura procesar
@@ -224,17 +261,17 @@ BEGIN
   END IF;
 
   -- Sumar todo lo conciliado para esta factura
-  SELECT
-    f.monto_total,
-    COALESCE(SUM(c.monto_aplicado), 0)
-  INTO v_monto_total, v_monto_pagado
-  FROM facturas f
+  SELECT f.monto_total, f.tipo_documento, COALESCE(SUM(c.monto_aplicado), 0)
+  INTO   v_monto_total, v_tipo_doc, v_monto_pagado
+  FROM   facturas f
   LEFT JOIN conciliaciones c ON c.factura_id = f.id
-  WHERE f.id = v_factura_id
-  GROUP BY f.monto_total;
+  WHERE  f.id = v_factura_id
+  GROUP  BY f.monto_total, f.tipo_documento;
 
-  -- Calcular estado
-  IF v_monto_pagado = 0 THEN
+  -- Notas de crédito: estado fijo 'nota_credito', no participan en conciliaciones (migración 007/008)
+  IF v_tipo_doc = 'nota_credito' THEN
+    v_nuevo_estado := 'nota_credito';
+  ELSIF v_monto_pagado = 0 THEN
     v_nuevo_estado := 'pendiente';
   ELSIF v_monto_pagado < v_monto_total THEN
     v_nuevo_estado := 'parcial';
@@ -242,14 +279,13 @@ BEGIN
     v_nuevo_estado := 'pagada';
   END IF;
 
-  -- Actualizar factura
+  -- Actualizar factura — preservar estados que no deben recalcularse
   UPDATE facturas
-  SET
-    monto_pagado = v_monto_pagado,
-    estado       = v_nuevo_estado,
-    updated_at   = NOW()
-  WHERE id = v_factura_id
-    AND estado != 'anulada';  -- No tocar facturas anuladas
+  SET    monto_pagado = v_monto_pagado,
+         estado       = v_nuevo_estado,
+         updated_at   = NOW()
+  WHERE  id = v_factura_id
+    AND  estado NOT IN ('anulada', 'nota_credito');
 
   RETURN COALESCE(NEW, OLD);
 END;

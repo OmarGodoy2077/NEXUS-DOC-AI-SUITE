@@ -46,6 +46,14 @@ export const facturasAPI = {
     const q = new URLSearchParams(params).toString();
     return request(`/facturas/reporte/control-pagos${q ? '?' + q : ''}`);
   },
+  previewSinRelacion: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return request(`/facturas/sin-relacion/preview${q ? '?' + q : ''}`);
+  },
+  eliminarSinRelacion: (body) => request('/facturas/sin-relacion', {
+    method: 'DELETE',
+    body: JSON.stringify({ confirmacion: 'ELIMINAR SIN RELACION', ...body }),
+  }),
 };
 
 // ── Métodos de Pago ─────────────────────────────────────────
@@ -102,5 +110,14 @@ export const excelAPI = {
 // ── Métricas ────────────────────────────────────────────────
 export const metricsAPI = {
   get: () => request('/metrics'),
+};
+
+// ── Admin (modo pruebas) ────────────────────────────────────
+export const adminAPI = {
+  resetAllData: (usuario_email) => request('/admin/reset-all-data', {
+    method: 'POST',
+    body: JSON.stringify({ confirmacion: 'RESET NEXUS DOC AI', usuario_email }),
+  }),
+  tokenStats: () => request('/admin/token-stats'),
 };
 

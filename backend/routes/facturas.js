@@ -101,6 +101,123 @@ module.exports = (supabase) => {
     }
   });
 
+  // GET /api/facturas/sin-relacion/preview — cuenta facturas eliminables (sin conciliaciones)
+  // Aplica los mismos filtros opcionales que listar facturas, para que el botón
+  // pueda mostrar "se eliminarán N facturas" antes de confirmar.
+  router.get('/sin-relacion/preview', async (req, res) => {
+    try {
+      const { desde, hasta, estado, tipo_documento, origen } = req.query;
+
+      // 1) IDs de facturas que SÍ tienen al menos una conciliación
+      const { data: conIds, error: cErr } = await supabase
+        .from('conciliaciones')
+        .select('factura_id');
+      if (cErr) throw cErr;
+      const conRelacion = new Set((conIds || []).map(c => c.factura_id));
+
+      // 2) Listar facturas elegibles aplicando los filtros del usuario
+      let query = supabase
+        .from('facturas')
+        .select('id, monto_pagado, estado, fecha_emision, tipo_documento, origen');
+      if (desde)          query = query.gte('fecha_emision', desde);
+      if (hasta)          query = query.lte('fecha_emision', hasta);
+      if (estado)         query = query.eq('estado', estado);
+      if (tipo_documento) query = query.eq('tipo_documento', tipo_documento);
+      if (origen)         query = query.eq('origen', origen);
+
+      const { data: todas, error: fErr } = await query;
+      if (fErr) throw fErr;
+
+      // 3) Filtrar: no en conciliaciones + monto_pagado = 0 (doble seguridad)
+      const eliminables = (todas || []).filter(f =>
+        !conRelacion.has(f.id) && Number(f.monto_pagado || 0) === 0
+      );
+
+      // Desglose informativo por estado
+      const porEstado = {};
+      eliminables.forEach(f => {
+        porEstado[f.estado] = (porEstado[f.estado] || 0) + 1;
+      });
+
+      res.json({
+        total_eliminables: eliminables.length,
+        por_estado: porEstado,
+        filtros_aplicados: { desde, hasta, estado, tipo_documento, origen },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // DELETE /api/facturas/sin-relacion — eliminar facturas SIN conciliaciones vinculadas.
+  // Requiere body: { confirmacion: 'ELIMINAR SIN RELACION' } + filtros opcionales.
+  router.delete('/sin-relacion', async (req, res) => {
+    try {
+      const { confirmacion, desde, hasta, estado, tipo_documento, origen, usuario_email } = req.body;
+
+      if (confirmacion !== 'ELIMINAR SIN RELACION') {
+        return res.status(400).json({
+          error: 'Confirmación inválida. Body requiere { confirmacion: "ELIMINAR SIN RELACION" }.',
+        });
+      }
+
+      // Repetir la misma lógica del preview para garantizar consistencia
+      const { data: conIds, error: cErr } = await supabase
+        .from('conciliaciones')
+        .select('factura_id');
+      if (cErr) throw cErr;
+      const conRelacion = new Set((conIds || []).map(c => c.factura_id));
+
+      let query = supabase
+        .from('facturas')
+        .select('id, monto_pagado');
+      if (desde)          query = query.gte('fecha_emision', desde);
+      if (hasta)          query = query.lte('fecha_emision', hasta);
+      if (estado)         query = query.eq('estado', estado);
+      if (tipo_documento) query = query.eq('tipo_documento', tipo_documento);
+      if (origen)         query = query.eq('origen', origen);
+
+      const { data: todas, error: fErr } = await query;
+      if (fErr) throw fErr;
+
+      const idsEliminables = (todas || [])
+        .filter(f => !conRelacion.has(f.id) && Number(f.monto_pagado || 0) === 0)
+        .map(f => f.id);
+
+      if (idsEliminables.length === 0) {
+        return res.json({
+          success: true,
+          eliminadas: 0,
+          message: 'No hay facturas elegibles para eliminar con los filtros actuales.',
+        });
+      }
+
+      console.log(`🗑️  Eliminando ${idsEliminables.length} facturas sin relación. Usuario: ${usuario_email || 'desconocido'}`);
+
+      // Eliminar en lotes de 500 para no exceder límites
+      const CHUNK = 500;
+      let eliminadas = 0;
+      for (let i = 0; i < idsEliminables.length; i += CHUNK) {
+        const slice = idsEliminables.slice(i, i + CHUNK);
+        const { error: dErr } = await supabase
+          .from('facturas')
+          .delete()
+          .in('id', slice);
+        if (dErr) throw dErr;
+        eliminadas += slice.length;
+      }
+
+      res.json({
+        success: true,
+        eliminadas,
+        message: `${eliminadas} factura(s) eliminada(s) correctamente.`,
+      });
+    } catch (err) {
+      console.error('Error eliminando facturas sin relación:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // GET /api/facturas/:id — detalle con conciliaciones (drill-down)
   router.get('/:id', async (req, res) => {
     try {

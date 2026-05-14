@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const crypto = require('crypto');
 const { analizarExcel, procesarConMapeo } = require('../utils/excelParser');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -25,21 +24,9 @@ module.exports = (supabase) => {
         return res.status(400).json({ error: 'El archivo debe ser formato Excel (.xls, .xlsx, .xlsm)' });
       }
 
-      // Verificar si ya fue importado (deduplicación por hash)
-      const fileHash = crypto.createHash('md5').update(req.file.buffer).digest('hex');
-      const { data: importacionExistente } = await supabase
-        .from('importaciones_excel')
-        .select('id, created_at, filas_importadas')
-        .eq('file_hash', fileHash)
-        .maybeSingle();
-
-      if (importacionExistente) {
-        return res.status(409).json({
-          error: 'Este archivo ya fue importado anteriormente.',
-          importacion_previa: importacionExistente,
-        });
-      }
-
+      // Nota: ya NO bloqueamos reimportar el mismo archivo.
+      // La deduplicación ahora es a nivel de fila (numero_autorizacion).
+      // Reimportar el mismo Excel es válido cuando contiene anulaciones nuevas.
       const analisis = analizarExcel(req.file.buffer, req.file.originalname);
 
       // No exponemos rawData al cliente, sólo el análisis
@@ -78,17 +65,6 @@ module.exports = (supabase) => {
 
       const analisis = analizarExcel(req.file.buffer, req.file.originalname);
 
-      // Segunda verificación de duplicado
-      const { data: importacionExistente } = await supabase
-        .from('importaciones_excel')
-        .select('id')
-        .eq('file_hash', analisis.fileHash)
-        .maybeSingle();
-
-      if (importacionExistente) {
-        return res.status(409).json({ error: 'Este archivo ya fue importado anteriormente.' });
-      }
-
       // Procesar con el mapeo confirmado
       const { registros, errores } = procesarConMapeo(analisis.rawData, analisis.headers, mapeo);
 
@@ -99,32 +75,143 @@ module.exports = (supabase) => {
         });
       }
 
-      // Insertar en lotes de 100 para no saturar la conexión
+      // ── PRE-CHECK: separar registros nuevos vs existentes por numero_autorizacion ──
+      const registrosConAuth = registros.filter(r => r.numero_autorizacion);
+      const registrosSinAuth = registros.filter(r => !r.numero_autorizacion);
+      const auths = registrosConAuth.map(r => r.numero_autorizacion);
+
+      // Traer en una sola consulta todas las facturas existentes con ese conjunto de UUIDs
+      const existentesMap = {};
+      if (auths.length > 0) {
+        // Chunk de 500 para evitar URIs gigantes en supabase-js
+        const CHUNK = 500;
+        for (let i = 0; i < auths.length; i += CHUNK) {
+          const slice = auths.slice(i, i + CHUNK);
+          const { data: existentes, error: eErr } = await supabase
+            .from('facturas')
+            .select('id, numero_autorizacion, estado, marca_anulado, monto_total, monto_pagado')
+            .in('numero_autorizacion', slice);
+          if (eErr) throw eErr;
+          existentes.forEach(e => { existentesMap[e.numero_autorizacion] = e; });
+        }
+      }
+
+      // ── Clasificar cada registro ──
+      const aInsertar       = [];       // nuevos (no existían)
+      const aActualizarAnular = [];     // existentes que cambiaron a anulado
+      const duplicadosReales  = [];     // existentes sin cambios
+
+      registrosConAuth.forEach(r => {
+        const existente = existentesMap[r.numero_autorizacion];
+        if (!existente) {
+          aInsertar.push(r);
+          return;
+        }
+
+        // ¿Cambió el estado de vigente → anulado?
+        // En el Excel: marca_anulado=true. En BD: estado != 'anulada'
+        if (r.marca_anulado && existente.estado !== 'anulada') {
+          aActualizarAnular.push({
+            id:                  existente.id,
+            numero_autorizacion: r.numero_autorizacion,
+            fecha_anulacion:     r.fecha_anulacion,
+            // Para construir el reporte: ¿tenía conciliaciones?
+            monto_pagado_previo: Number(existente.monto_pagado) || 0,
+          });
+        } else {
+          duplicadosReales.push(r.numero_autorizacion);
+        }
+      });
+
+      // Registros sin numero_autorizacion → tratarlos como insert directo (sin dedup)
+      aInsertar.push(...registrosSinAuth);
+
+      // ── 1) INSERTAR nuevos en lotes ──
       const BATCH_SIZE = 100;
       let insertados = 0;
-      let duplicados = 0;
       const erroresDB = [];
 
-      for (let i = 0; i < registros.length; i += BATCH_SIZE) {
-        const lote = registros.slice(i, i + BATCH_SIZE).map(r => ({
+      for (let i = 0; i < aInsertar.length; i += BATCH_SIZE) {
+        const lote = aInsertar.slice(i, i + BATCH_SIZE).map(r => ({
           ...r,
-          tipo_documento,
+          // El parser ya decide tipo_documento ('nota_credito' o 'compra').
+          // Solo lo sobrescribimos con el del formulario si NO es nota de crédito.
+          tipo_documento:   r.tipo_documento === 'nota_credito' ? 'nota_credito' : tipo_documento,
           usuario_creacion: usuario_email,
         }));
 
         const { data: inserted, error: iErr } = await supabase
           .from('facturas')
-          .upsert(lote, {
-            onConflict: 'numero_autorizacion',
-            ignoreDuplicates: true,
-          })
+          .upsert(lote, { onConflict: 'numero_autorizacion', ignoreDuplicates: true })
           .select('id');
 
         if (iErr) {
           erroresDB.push({ lote: Math.floor(i / BATCH_SIZE) + 1, error: iErr.message });
         } else {
           insertados += inserted?.length || 0;
-          duplicados += lote.length - (inserted?.length || 0);
+        }
+      }
+
+      // ── 2) ANULAR facturas que cambiaron de estado ──
+      // Para cada una: identificar si tenía conciliaciones, revertirlas, y marcarla como anulada.
+      const facturasAnuladasConRelaciones = [];
+      let conciliacionesRevertidas = 0;
+      let facturasAnuladas = 0;
+
+      for (const af of aActualizarAnular) {
+        // Buscar conciliaciones vinculadas a esta factura
+        const { data: conciliaciones, error: cErr } = await supabase
+          .from('conciliaciones')
+          .select('id, monto_aplicado, metodo_pago_id, metodos_pago(tipo, banco, numero_documento)')
+          .eq('factura_id', af.id);
+
+        if (cErr) {
+          erroresDB.push({ anulacion: af.numero_autorizacion, error: cErr.message });
+          continue;
+        }
+
+        if (conciliaciones && conciliaciones.length > 0) {
+          // Registrar para el reporte que se mostrará al usuario
+          facturasAnuladasConRelaciones.push({
+            numero_autorizacion: af.numero_autorizacion,
+            monto_pagado_previo: af.monto_pagado_previo,
+            conciliaciones: conciliaciones.map(c => ({
+              id:               c.id,
+              monto_aplicado:   Number(c.monto_aplicado),
+              tipo_pago:        c.metodos_pago?.tipo,
+              banco:            c.metodos_pago?.banco,
+              numero_documento: c.metodos_pago?.numero_documento,
+            })),
+          });
+
+          // Revertir conciliaciones (los triggers ajustan saldos automáticamente)
+          const idsBorrar = conciliaciones.map(c => c.id);
+          const { error: dErr } = await supabase
+            .from('conciliaciones')
+            .delete()
+            .in('id', idsBorrar);
+          if (dErr) {
+            erroresDB.push({ anulacion: af.numero_autorizacion, error: 'No se pudieron revertir conciliaciones: ' + dErr.message });
+            continue;
+          }
+          conciliacionesRevertidas += conciliaciones.length;
+        }
+
+        // Marcar la factura como anulada
+        const { error: uErr } = await supabase
+          .from('facturas')
+          .update({
+            estado:          'anulada',
+            marca_anulado:   true,
+            fecha_anulacion: af.fecha_anulacion,
+            updated_at:      new Date().toISOString(),
+          })
+          .eq('id', af.id);
+
+        if (uErr) {
+          erroresDB.push({ anulacion: af.numero_autorizacion, error: uErr.message });
+        } else {
+          facturasAnuladas++;
         }
       }
 
@@ -137,7 +224,7 @@ module.exports = (supabase) => {
         file_hash:           analisis.fileHash,
         total_filas:         analisis.totalFilas,
         filas_importadas:    insertados,
-        filas_duplicadas:    duplicados,
+        filas_duplicadas:    duplicadosReales.length,
         filas_error:         errores.length + erroresDB.length,
         mapeo_columnas:      mapeo,
         periodo_desde:       fechas[0] || null,
@@ -150,13 +237,16 @@ module.exports = (supabase) => {
       res.json({
         success: true,
         resumen: {
-          total_en_archivo: analisis.totalFilas,
+          total_en_archivo:    analisis.totalFilas,
           insertados,
-          duplicados,
-          errores_parseo: errores.length,
-          errores_db: erroresDB.length,
+          duplicados:          duplicadosReales.length,
+          facturas_anuladas:   facturasAnuladas,
+          conciliaciones_revertidas: conciliacionesRevertidas,
+          errores_parseo:      errores.length,
+          errores_db:          erroresDB.length,
         },
-        errores: errores.slice(0, 20), // max 20 errores en respuesta
+        facturas_anuladas_con_relaciones: facturasAnuladasConRelaciones,
+        errores: errores.slice(0, 20),
       });
     } catch (err) {
       console.error('Error en importación Excel:', err.message);

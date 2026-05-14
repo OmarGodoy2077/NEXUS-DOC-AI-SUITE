@@ -1,9 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-// Tesseract.js ya no es necesario
-// const Tesseract = require('tesseract.js'); 
 const { createClient } = require('@supabase/supabase-js');
+const { GoogleGenAI } = require('@google/genai');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -16,6 +15,13 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// ─── Google Gemini ──────────────────────────────────────────
+if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'TU_API_KEY_AQUI') {
+  console.warn('⚠️  GEMINI_API_KEY no configurada. El OCR fallará hasta que la pegues en backend/.env');
+}
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
 // ─── Middleware ─────────────────────────────────────────────
 app.use(cors());
 // Aumentar el límite para aceptar imágenes base64 del frontend
@@ -26,11 +32,13 @@ const facturasRouter       = require('./routes/facturas')(supabase);
 const metodosPagoRouter    = require('./routes/metodosPago')(supabase);
 const conciliacionesRouter = require('./routes/conciliaciones')(supabase);
 const importacionRouter    = require('./routes/importacionExcel')(supabase);
+const adminRouter          = require('./routes/admin')(supabase);
 
 app.use('/api/facturas',          facturasRouter);
 app.use('/api/metodos-pago',      metodosPagoRouter);
 app.use('/api/conciliaciones',    conciliacionesRouter);
 app.use('/api/importacion-excel', importacionRouter);
+app.use('/api/admin',             adminRouter);
 
 // ─── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -38,7 +46,7 @@ app.get('/api/health', (req, res) => {
     status: 'OK',
     project: 'NEXUS DOC AI SUITE',
     version: '2.1.0', // Versión actualizada
-    modules: ['facturas', 'metodos-pago', 'conciliaciones', 'importacion-excel', 'ocr-llava'],
+    modules: ['facturas', 'metodos-pago', 'conciliaciones', 'importacion-excel', 'admin', `ocr-${GEMINI_MODEL}`],
   });
 });
 
@@ -76,59 +84,123 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
     }
 
     // ─── PASO 1: IA Multimodal (ANTES de tocar storage) ────────────────────
-    console.log('🤖 Analizando imagen con MiniCPM-V...');
+    console.log(`🤖 Analizando imagen con ${GEMINI_MODEL}...`);
     const prompt = `
-      Eres una herramienta de extracción OCR estricta. Transcribe EXACTAMENTE lo que ves en la imagen. NO inventes palabras, no intentes hacer cálculos ni transformes formatos. Responde ÚNICAMENTE con un JSON válido, sin bloques de código ni texto adicional.
-      
-      Utiliza estrictamente esta estructura y sigue el ejemplo de lo que debes buscar:
-      {
-        "beneficiario": "El nombre literal junto a 'Pago a la orden de:' (Ej: 'José Fasselli')",
-        "fecha": "Copia el texto de la fecha tal como está escrito (Ej: 'Guatemala, 4 de Julio 2017')",
-        "monto": "El valor numérico final del cheque. CRUCIAL: Lee atentamente la cantidad escrita en letras (ej: 'Un mil trescientos') para confirmar la magnitud (miles, cientos, etc.) y evitar errores de decimales. Escribe el número SIN comas de miles y usando PUNTO exclusivamente para los decimales (Ej: '1300.00' y NO '1.300').",
-        "monto_en_letras": "El texto literal junto a 'Suma de:' (Ej: 'Un mil trescientos quetzales exactos')",
-        "banco": "El nombre de la institución del logo (Ej: 'BANCO INDUSTRIAL')",
-        "numero_documento": "El código debajo de la frase 'Cheque No.' (Ej: '0000001'). Ojo: ESTE ES EL CORRELATIVO DEL DOCUMENTO, NO EL DINERO.",
-        "tipo": "Define de qué trata. Si lees explícitamente la palabra 'cheque' (ej: 'Cheque No.'), el valor debe ser ESTRICTAMENTE 'cheque'. Mismo caso para 'transferencia' o 'deposito'."
-      }
-    `;
+Eres un OCR experto en documentos financieros de GUATEMALA, ESPECIALIZADO EN LECTURA DE ESCRITURA A MANO en cheques. Transcribe LITERALMENTE lo que ves. NO inventes datos, NO traduzcas, NO calcules. Responde EXCLUSIVAMENTE con un JSON válido, sin markdown.
+
+═══════════════════════════════════════════════
+CONTEXTO PAÍS — GUATEMALA
+═══════════════════════════════════════════════
+• Moneda: QUETZAL (símbolos: "Q", "Q.", "GTQ"). Jamás pesos, dólares, soles ni euros.
+• Bancos del país: BANRURAL, BANCO INDUSTRIAL, BAM (Banco Agromercantil), BANCO G&T CONTINENTAL, BANTRAB, BANCO PROMERICA, BANCO DE LOS TRABAJADORES, BAC CREDOMATIC, BANCO DE AMÉRICA CENTRAL, INTERBANCO, FICOHSA, VIVIBANCO, BANCO INMOBILIARIO, CITIBANK GUATEMALA.
+• Fechas en español: enero, febrero, marzo, abril, mayo, junio, julio, agosto, septiembre, octubre, noviembre, diciembre. Formatos: 'dd/mm/yyyy' o 'Guatemala, DÍA de MES YYYY'.
+• Cheques: contienen "Cheque No.", "Páguese a la orden de", "Suma de" (monto en letras), y al lado un cuadro con "Q" + monto numérico.
+• Transferencias / depósitos digitales: muestran "Cuenta origen", "Cuenta destino", "Monto a transferir", "No. Ref:", "# Ref:", "No. Boleta", "No. Operación".
+
+═══════════════════════════════════════════════
+CHEQUES MANUSCRITOS — ATENCIÓN ESPECIAL
+═══════════════════════════════════════════════
+En Guatemala los cheques son llenados A MANO con bolígrafo. La letra puede ser cursiva, imprenta o mezcla. APLICA ESTAS REGLAS:
+
+1. CAMPOS MANUSCRITOS típicos: beneficiario, fecha, monto en números, monto en letras, firma (la firma NO se transcribe).
+
+2. PARTES PRE-IMPRESAS (en TIPOGRAFÍA): nombre del banco, "Cheque No." + número, "Páguese a la orden de", "Suma de", "Q", líneas de relleno. ESTO ES TEXTO IMPRESO, lee con normalidad.
+
+3. CRUCE-VERIFICACIÓN DEL MONTO (regla #1 anti-error):
+   El monto numérico (la mano puede tener un "2" mal cerrado que parezca "7", un "1" que parezca "7", un "0" que parezca "6", o ceros decimales tachados).
+   SIEMPRE verifica el monto contra el MONTO EN LETRAS manuscrito:
+   • "quinientos veinticinco" → 525.00, NUNCA 5,250 ni 52.50
+   • "un mil trescientos" → 1300.00
+   • "tres mil quinientos exactos" → 3500.00
+   • "cincuenta y dos quetzales con cincuenta centavos" → 52.50
+   • Si las letras dicen 525 pero los números parecen 5250, CONFÍA EN LAS LETRAS.
+
+4. NÚMEROS MANUSCRITOS — ambigüedades comunes en Guatemala:
+   • "1" sin patita y "7" sin barra horizontal — usa contexto del monto en letras.
+   • "Ø" (cero cruzado, estilo europeo) = 0, NO ø ni Ø.
+   • "5" abierto arriba puede parecer "S" — siempre es 5.
+   • Decimales: a veces escriben "00/100" en lugar de ".00".
+   • Comas y puntos de miles: "1,500.00" o "1.500,00" — usa el monto en letras para resolver.
+
+5. NOMBRES MANUSCRITOS de beneficiarios:
+   • Pueden estar en cursiva o imprenta. Acepta tildes y mayúsculas mezcladas.
+   • Si el nombre es ilegible o solo se ve una firma, devuelve "" (vacío) en beneficiario.
+   • NO inventes nombres si no estás seguro.
+
+6. FECHAS MANUSCRITAS:
+   • Suelen ir en "Guatemala, DD de MES YYYY" con DD y YYYY a mano y "de", "Guatemala," impresos.
+   • A veces escriben con dos dígitos el año ("17" en lugar de "2017") — si es ambiguo, copia tal cual.
+
+═══════════════════════════════════════════════
+ESTRUCTURA JSON OBLIGATORIA
+═══════════════════════════════════════════════
+{
+  "beneficiario": "Nombre del beneficiario o receptor. En cheques manuscritos: lee la línea junto a 'Páguese a la orden de'. En transferencias digitales: 'Cuenta destino'. Si está ilegible, devuelve ''.",
+  "fecha": "Copia EXACTA del texto de fecha tal como aparece. Ejemplos: 'Guatemala, 4 de julio del 2017', '10/05/2026', '15/03/2026 14:30:22'. NO conviertas formato.",
+  "monto": "Valor numérico final. SIEMPRE cruza con el monto en letras para resolver ambigüedades manuscritas. Formato: SIN comas de miles, con PUNTO decimal. Ejemplos correctos: '525.00', '1300.00', '52.50'. INCORRECTO: '1.300' (esto sería mil trescientos pero parece 1.30).",
+  "monto_en_letras": "Texto literal del monto en letras, manuscrito en cheques. Ejemplos: 'Quinientos veinticinco quetzales exactos', 'Un mil trescientos quetzales con 00/100'. Si no existe (transferencias), devuelve ''.",
+  "banco": "Nombre del banco emisor visible en el logo / cabecera (es texto IMPRESO, fácil de leer). USA un nombre exacto de la lista de bancos arriba. Ej: 'BANRURAL', 'BANCO INDUSTRIAL'.",
+  "numero_documento": "Correlativo del documento. En cheques: junto a 'Cheque No.' (texto IMPRESO, no confundir con el monto). En transferencias: '# Ref:', 'No. Operación', 'No. Boleta'. Solo dígitos. Ej: '0000001', '995500221'.",
+  "tipo": "EXACTAMENTE uno de: 'cheque' | 'transferencia' | 'deposito' | 'efectivo'. Reglas: 'Cheque No.' o documento de bolsillo con firma → 'cheque'. 'Cuenta destino' / 'transferir' → 'transferencia'. 'Depósito monetario' / 'Boleta' → 'deposito'. 'Recibo de caja' → 'efectivo'."
+}
+
+═══════════════════════════════════════════════
+REGLAS CRÍTICAS FINALES
+═══════════════════════════════════════════════
+1. Si un campo no se ve o no se entiende, devuélvelo como "" — JAMÁS inventes.
+2. NO traduzcas nombres propios ni razones sociales.
+3. NO conviertas formato de fecha — cópialo LITERAL.
+4. Monto SIEMPRE en formato '0000.00' (punto decimal, sin separador de miles).
+5. En CHEQUES, el monto en letras es la verdad absoluta. Si choca con los dígitos manuscritos, RESPETA las letras.
+`;
 
     let datosEstructurados = {};
+    let tokensUsage = { prompt: null, respuesta: null, total: null };
     try {
-      const aiResponse = await fetch('http://localhost:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'minicpm-v',
-          prompt: prompt,
-          images: [imageBase64],
-          stream: false,
-          format: 'json',
-          options: {
-            temperature: 0.0 // Crucial: Temperatura 0 para evitar que la IA alucine ("invente" datos como 3000 o pesetas)
-          }
-        }),
-        signal: AbortSignal.timeout(60000),
+      // Detectar mimeType desde los primeros bytes del buffer (PNG, JPEG, WebP)
+      const detectMime = (buf) => {
+        if (buf.length < 12) return 'image/png';
+        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
+        if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+        if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46
+            && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
+        return 'image/png';
+      };
+      const mimeType = detectMime(imageBuffer);
+
+      const aiResponse = await genAI.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [
+          { role: 'user', parts: [
+            { text: prompt },
+            { inlineData: { mimeType, data: imageBase64 } },
+          ]},
+        ],
+        config: {
+          temperature: 0.0,
+          responseMimeType: 'application/json',
+        },
       });
 
-      if (!aiResponse.ok) {
-        const errorBody = await aiResponse.text();
-        throw new Error(`Error de MiniCPM-V: ${aiResponse.status} ${errorBody}`);
-      }
+      const responseText = aiResponse.text || '';
+      if (!responseText) throw new Error('Gemini devolvió respuesta vacía');
 
-      const aiData = await aiResponse.json();
-      // El modelo a veces envuelve el JSON en texto, lo extraemos.
-      const jsonMatch = aiData.response.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        datosEstructurados = JSON.parse(jsonMatch[0]);
-      } else {
-        // Si no hay JSON, intentamos parsear la respuesta completa
-        datosEstructurados = JSON.parse(aiData.response);
-      }
-      console.log('✅ Datos extraídos por MiniCPM-V:', datosEstructurados);
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      datosEstructurados = JSON.parse(jsonMatch ? jsonMatch[0] : responseText);
+
+      // Capturar consumo de tokens reportado por Gemini para auditoría/costos
+      const usage = aiResponse.usageMetadata || {};
+      tokensUsage = {
+        prompt:    usage.promptTokenCount     ?? null,
+        respuesta: usage.candidatesTokenCount ?? null,
+        total:     usage.totalTokenCount      ?? null,
+      };
+
+      console.log(`✅ Datos extraídos por ${GEMINI_MODEL} — tokens: ${tokensUsage.total} (prompt: ${tokensUsage.prompt}, respuesta: ${tokensUsage.respuesta})`);
 
     } catch (e) {
-      console.error('❌ Error procesando con MiniCPM-V:', e.message);
-      return res.status(500).json({ error: `Error con el modelo MiniCPM-V: ${e.message}` });
+      console.error(`❌ Error procesando con ${GEMINI_MODEL}:`, e.message);
+      return res.status(500).json({ error: `Error con Gemini: ${e.message}` });
     }
 
     // Limpieza inteligente del campo monto para evitar bugs con "Q."
@@ -199,7 +271,18 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
     }
 
     // ─── PASO 3: Subir a Storage SOLO si OCR + validaciones pasaron ─────────
-    const fileName = `${Date.now()}_${originalFilename}`;
+    // Sanitizar el nombre: quitar espacios, caracteres especiales, mantener extensión
+    const sanitizeFilename = (name) => {
+      const lastDot = name.lastIndexOf('.');
+      const ext = lastDot > -1 ? name.substring(lastDot).toLowerCase() : '';
+      const base = (lastDot > -1 ? name.substring(0, lastDot) : name)
+        .replace(/[^\w-]+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_|_$/g, '')
+        .substring(0, 80);
+      return `${base}${ext}`;
+    };
+    const fileName = `${Date.now()}_${sanitizeFilename(originalFilename)}`;
     const { error: storageError } = await supabase.storage
       .from('comprobantes')
       .upload(fileName, imageBuffer, { contentType: 'image/png' });
@@ -227,6 +310,11 @@ app.post('/api/process-document', upload.single('document'), async (req, res) =>
         origen:           'ocr_upload',
         usuario_creacion: correoUsuarioFinal,
         estado:           'borrador',
+        // Auditoría de uso del modelo
+        tokens_prompt:    tokensUsage.prompt,
+        tokens_respuesta: tokensUsage.respuesta,
+        tokens_total:     tokensUsage.total,
+        ocr_modelo:       GEMINI_MODEL,
       }])
       .select()
       .single();
@@ -330,6 +418,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-  console.log(`\n🚀 NEXUS DOC AI SUITE v2.0 listo en http://localhost:${port}`);
-  console.log('   Módulos activos: facturas | metodos-pago | conciliaciones | importacion-excel | OCR');
+  console.log(`\n🚀 NEXUS DOC AI SUITE v2.1 listo en http://localhost:${port}`);
+  console.log(`   Módulos activos: facturas | metodos-pago | conciliaciones | importacion-excel | admin`);
+  console.log(`   OCR: ${GEMINI_MODEL} (Google Gemini API)`);
 });

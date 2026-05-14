@@ -112,8 +112,12 @@ function analizarExcel(buffer, nombreArchivo) {
   }
 
   // Fila 0 = encabezados, resto = datos
-  const headers = rawData[0].map(h => String(h).trim());
-  const dataRows = rawData.slice(1).filter(row => row.some(cell => cell !== ''));
+  // Algunos .xls antiguos del SAT vienen en CP-1252 y xlsx los entrega como
+  // UTF-8 mal decodificado (mojibake: "AutorizaciÃ³n" en vez de "Autorización").
+  const headers = rawData[0].map(h => repararMojibake(String(h).trim()));
+  const dataRows = rawData.slice(1)
+    .filter(row => row.some(cell => cell !== ''))
+    .map(row => row.map(cell => typeof cell === 'string' ? repararMojibake(cell) : cell));
 
   // Inferir mapeo
   const mappingSugerido = inferirMapeo(headers);
@@ -235,10 +239,21 @@ function transformarFila(filaCompleta, headers, mapeo, filaNum) {
 
   // Campo obligatorio: monto_total
   const montoRaw = get('monto_total');
-  const monto = parsearMonto(montoRaw);
+  let monto = parsearMonto(montoRaw);
   if (!monto || monto <= 0) {
     throw new Error(`Fila ${filaNum}: monto_total inválido (${montoRaw})`);
   }
+
+  // Detección de Nota de Crédito → el monto pasa a NEGATIVO porque resta a las facturas
+  // Formas que el SAT puede usar para identificarla: 'NCRE', 'NotaCredito', 'Nota de Crédito'
+  const tipoDteRaw = String(get('tipo_dte') || '').toUpperCase().trim();
+  const esNotaCredito =
+    tipoDteRaw === 'NCRE' ||
+    tipoDteRaw.includes('NOTA DE CR') ||
+    tipoDteRaw.includes('NOTA CR') ||
+    tipoDteRaw.includes('NOTACREDITO');
+
+  if (esNotaCredito) monto = -Math.abs(monto);
 
   // Estado SAT → estado interno
   const estadoSAT = String(get('estado') || '').toLowerCase();
@@ -278,15 +293,40 @@ function transformarFila(filaCompleta, headers, mapeo, filaNum) {
     monto_total:           monto,
     monto_iva:             parsearMonto(get('monto_iva')) || 0,
     otros_impuestos:       otrosImpuestos,
-    estado:                esAnulado ? 'anulada' : 'pendiente',
+    // Estado inicial:
+    //   - Anulada SAT  → 'anulada'
+    //   - Nota crédito → 'nota_credito' (no participa en conciliaciones; se usa como ajuste al cuadrar)
+    //   - Resto        → 'pendiente'
+    estado:                esAnulado ? 'anulada' : (esNotaCredito ? 'nota_credito' : 'pendiente'),
+    // Si es NCRE, la clasificación contable cambia a nota_credito
+    tipo_documento:        esNotaCredito ? 'nota_credito' : 'compra',
     origen:                'sat_excel',
-    tipo_documento:        'compra',
   };
 }
 
 // ─────────────────────────────────────────────────────────────
 // UTILIDADES DE PARSEO
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * Repara mojibake típico de archivos Excel del SAT.
+ * El xlsx parser entrega bytes Latin-1 como si fueran UTF-8, generando:
+ *   "Ã³" en vez de "ó", "Ã±" en vez de "ñ", "Ã©" en vez de "é", etc.
+ *
+ * Estrategia: si detectamos "Ã" en el string (señal inequívoca de mojibake),
+ * convertimos el string a bytes Latin-1 y los re-decodificamos como UTF-8.
+ */
+function repararMojibake(str) {
+  if (typeof str !== 'string') return str;
+  if (!str.includes('Ã') && !str.includes('Â')) return str;
+  try {
+    // Buffer.from(str, 'latin1') invierte la mala decodificación,
+    // y toString('utf8') la rehace correctamente.
+    return Buffer.from(str, 'latin1').toString('utf8');
+  } catch {
+    return str;
+  }
+}
 
 function normalizar(str) {
   return String(str)

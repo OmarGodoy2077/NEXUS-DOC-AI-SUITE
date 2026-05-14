@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FileSpreadsheet, CheckCircle2, AlertCircle, RefreshCw, ArrowRight, ArrowLeft, Eye, History } from 'lucide-react';
+import { Upload, FileSpreadsheet, CheckCircle2, AlertCircle, RefreshCw, ArrowRight, ArrowLeft, Eye, History, AlertTriangle, Unlink } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
+import { Modal } from '../components/ui/Modal';
 import { excelAPI } from '../services/api';
 import { useApp } from '../context/AppContext';
 
@@ -39,6 +40,8 @@ export function ImportarExcel() {
   const [importando,  setImportando]  = useState(false);
   const [resultado,   setResultado]   = useState(null);
   const [erroresDetalle, setErroresDetalle] = useState([]);
+  const [anulaciones, setAnulaciones] = useState([]);
+  const [anulacionesModalOpen, setAnulacionesModalOpen] = useState(false);
   const [historial,   setHistorial]   = useState([]);
   const [verHistorial,setVerHistorial]= useState(false);
   const [drag,        setDrag]        = useState(false);
@@ -85,7 +88,11 @@ export function ImportarExcel() {
       const res = await excelAPI.confirmar(archivo, mapeo, tipodoc, user?.email || 'sistema');
       setResultado(res.resumen);
       setErroresDetalle(res.errores || []);
+      const anulConRel = res.facturas_anuladas_con_relaciones || [];
+      setAnulaciones(anulConRel);
       setPaso(2);
+      // Auto-abrir modal de anulaciones si hubo facturas anuladas con conciliaciones
+      if (anulConRel.length > 0) setAnulacionesModalOpen(true);
       excelAPI.historial().then(r => setHistorial(r.data || [])).catch(() => {});
     } catch (e) {
       // Fetch error body for row-level details when available
@@ -98,13 +105,16 @@ export function ImportarExcel() {
   const reiniciar = () => {
     setPaso(0); setArchivo(null); setAnalisis(null);
     setMapeo({}); setResultado(null);
+    setAnulaciones([]); setErroresDetalle([]);
     if (fileRef.current) fileRef.current.value = '';
   };
 
-  const select = 'bg-apple-bg border border-apple-border rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text w-full';
+  const fmtQ = (n) => `Q ${Number(n || 0).toLocaleString('es-GT', { minimumFractionDigits: 2 })}`;
+
+  const select = 'bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text w-full appearance-none cursor-pointer';
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto">
+    <div className="space-y-6 max-w-5xl mx-auto">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-apple-text">Importar Excel SAT</h1>
@@ -231,18 +241,25 @@ export function ImportarExcel() {
                 <p className="text-xs text-apple-textSecondary mt-0.5">Verifica que cada campo del sistema corresponda a la columna correcta del Excel. Los campos <span className="text-apple-error">*</span> son obligatorios.</p>
               </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {CAMPOS_SISTEMA.map(({ campo, label, req }) => {
                 const colActual = mapeo[campo];
                 const headerActual = colActual !== undefined ? analisis.headers[colActual] : null;
+                const mapped = colActual !== undefined;
                 return (
-                  <div key={campo} className="flex items-center gap-3 bg-apple-bg border border-apple-border rounded-apple p-3">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-medium text-apple-text">
-                        {label} {req && <span className="text-apple-error">*</span>}
+                  <div
+                    key={campo}
+                    className={`bg-apple-bg border rounded-apple p-3 space-y-2 transition-apple ${
+                      mapped ? 'border-apple-success/30' : req ? 'border-apple-warning/40' : 'border-apple-border'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2 min-h-[32px]">
+                      <p className="text-xs font-medium text-apple-text leading-tight">
+                        {label}
+                        {req && <span className="text-apple-error ml-0.5">*</span>}
                       </p>
-                      {headerActual && (
-                        <p className="text-xs text-apple-success mt-0.5 truncate">← "{headerActual}"</p>
+                      {mapped && (
+                        <CheckCircle2 size={13} className="text-apple-success shrink-0 mt-0.5" />
                       )}
                     </div>
                     <select
@@ -252,12 +269,18 @@ export function ImportarExcel() {
                         const val = e.target.value;
                         setMapeo(m => val === '' ? (({ [campo]: _, ...rest }) => rest)(m) : { ...m, [campo]: Number(val) });
                       }}
+                      title={headerActual || 'Sin mapear'}
                     >
                       <option value="">— Sin mapear —</option>
                       {analisis.headers.map((h, i) => (
-                        <option key={i} value={i}>{i}: {h.slice(0, 30)}{h.length > 30 ? '…' : ''}</option>
+                        <option key={i} value={i}>{i}: {h}</option>
                       ))}
                     </select>
+                    {headerActual && (
+                      <p className="text-[11px] text-apple-textSecondary truncate" title={headerActual}>
+                        Columna: <span className="text-apple-success">{headerActual}</span>
+                      </p>
+                    )}
                   </div>
                 );
               })}
@@ -317,12 +340,45 @@ export function ImportarExcel() {
             <p className="text-xl font-semibold text-apple-text">Importación completada</p>
             <p className="text-sm text-apple-textSecondary mt-1">{archivo?.name}</p>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 max-w-lg mx-auto">
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 max-w-2xl mx-auto">
             <ResultStat label="En archivo"  value={resultado.total_en_archivo} color="text-apple-text" />
             <ResultStat label="Insertadas"  value={resultado.insertados}       color="text-apple-success" />
             <ResultStat label="Duplicadas"  value={resultado.duplicados}       color="text-apple-textSecondary" />
-            <ResultStat label="Errores"     value={resultado.errores_parseo + resultado.errores_db} color={resultado.errores_parseo + resultado.errores_db > 0 ? 'text-apple-error' : 'text-apple-textSecondary'} />
+            <ResultStat label="Anuladas"    value={resultado.facturas_anuladas || 0} color={(resultado.facturas_anuladas || 0) > 0 ? 'text-apple-warning' : 'text-apple-textSecondary'} />
           </div>
+
+          {(resultado.conciliaciones_revertidas > 0 || resultado.errores_parseo + resultado.errores_db > 0) && (
+            <div className="grid grid-cols-2 gap-4 max-w-md mx-auto">
+              {resultado.conciliaciones_revertidas > 0 && (
+                <ResultStat label="Conciliaciones revertidas" value={resultado.conciliaciones_revertidas} color="text-apple-warning" />
+              )}
+              {resultado.errores_parseo + resultado.errores_db > 0 && (
+                <ResultStat label="Errores" value={resultado.errores_parseo + resultado.errores_db} color="text-apple-error" />
+              )}
+            </div>
+          )}
+
+          {/* Banner de anulaciones con relaciones */}
+          {anulaciones.length > 0 && (
+            <div className="max-w-2xl mx-auto bg-apple-warning/10 border border-apple-warning/30 rounded-apple p-4 text-left">
+              <div className="flex items-start gap-3">
+                <AlertTriangle size={20} className="text-apple-warning shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-apple-warning">
+                    {anulaciones.length} factura{anulaciones.length > 1 ? 's' : ''} anulada{anulaciones.length > 1 ? 's' : ''} tenía{anulaciones.length > 1 ? 'n' : ''} pagos vinculados
+                  </p>
+                  <p className="text-xs text-apple-textSecondary mt-0.5">
+                    Las conciliaciones fueron revertidas automáticamente y los métodos de pago liberados.
+                  </p>
+                </div>
+                <Button size="sm" variant="outline" onClick={() => setAnulacionesModalOpen(true)} className="gap-1.5 text-apple-warning border-apple-warning/40">
+                  Ver detalles
+                </Button>
+              </div>
+            </div>
+          )}
+
           {erroresDetalle.length > 0 && (
             <div className="text-left max-w-lg mx-auto space-y-1.5">
               <p className="text-xs font-medium text-apple-warning flex items-center gap-1.5">
@@ -342,6 +398,73 @@ export function ImportarExcel() {
           </Button>
         </Card>
       )}
+
+      {/* Modal: detalle de facturas anuladas con conciliaciones revertidas */}
+      <Modal
+        open={anulacionesModalOpen}
+        onClose={() => setAnulacionesModalOpen(false)}
+        title="Facturas Anuladas con Pagos Vinculados"
+        width="max-w-2xl"
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 p-3 bg-apple-warning/10 border border-apple-warning/30 rounded-apple">
+            <AlertTriangle size={18} className="text-apple-warning shrink-0 mt-0.5" />
+            <div className="text-sm">
+              <p className="font-medium text-apple-warning">
+                Estas facturas cambiaron a "Anulada" en el Excel pero ya tenían pagos conciliados.
+              </p>
+              <p className="text-xs text-apple-textSecondary mt-1">
+                Las conciliaciones se revirtieron automáticamente y el saldo de los métodos de pago fue restaurado.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+            {anulaciones.map((a) => (
+              <div key={a.numero_autorizacion} className="bg-apple-bg border border-apple-border rounded-apple p-3">
+                <div className="flex items-start justify-between gap-3 mb-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs text-apple-textSecondary">UUID SAT</p>
+                    <p className="font-mono text-xs text-apple-accent break-all">{a.numero_autorizacion}</p>
+                  </div>
+                  <span className="text-xs px-2 py-0.5 bg-apple-error/10 text-apple-error rounded font-medium shrink-0">
+                    Anulada
+                  </span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <p className="text-xs text-apple-textSecondary flex items-center gap-1.5">
+                    <Unlink size={11} />
+                    {a.conciliaciones.length} pago{a.conciliaciones.length > 1 ? 's' : ''} revertido{a.conciliaciones.length > 1 ? 's' : ''}:
+                  </p>
+                  <div className="space-y-1">
+                    {a.conciliaciones.map((c) => (
+                      <div key={c.id} className="flex items-center justify-between text-xs px-2 py-1.5 bg-apple-bgSecondary rounded">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="capitalize text-apple-text">{c.tipo_pago || '—'}</span>
+                          {c.banco && <span className="text-apple-textSecondary truncate">· {c.banco}</span>}
+                          {c.numero_documento && <span className="text-apple-textSecondary">· #{c.numero_documento}</span>}
+                        </div>
+                        <span className="tabular-nums font-medium text-apple-success shrink-0 ml-2">
+                          {fmtQ(c.monto_aplicado)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex justify-between text-xs pt-1 border-t border-apple-border/40">
+                    <span className="text-apple-textSecondary">Monto liberado:</span>
+                    <span className="font-semibold tabular-nums text-apple-warning">{fmtQ(a.monto_pagado_previo)}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex justify-end">
+            <Button onClick={() => setAnulacionesModalOpen(false)}>Entendido</Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

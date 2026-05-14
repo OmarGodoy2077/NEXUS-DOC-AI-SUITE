@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Eye, RefreshCw, Filter, Search, ChevronLeft, ChevronRight, FileSpreadsheet } from 'lucide-react';
+import { Eye, RefreshCw, Filter, Search, ChevronLeft, ChevronRight, FileSpreadsheet, Trash2, AlertTriangle, Loader2, CheckCircle2 } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
+import { Modal } from '../components/ui/Modal';
 import { EstadoBadge } from '../components/finance/EstadoBadge';
 import { PeriodFilter, periodoToRange } from '../components/finance/PeriodFilter';
 import { DrillDownModal } from '../components/finance/DrillDownModal';
 import { facturasAPI } from '../services/api';
+import { useApp } from '../context/AppContext';
 
 const Q = (n) => `Q ${Number(n || 0).toLocaleString('es-GT', { minimumFractionDigits: 2 })}`;
 const PAGE_SIZE = 25;
@@ -15,6 +17,7 @@ const TIPOS   = ['compra', 'venta', 'nota_credito', 'nota_debito'];
 const ORIGENES = ['sat_excel', 'ocr_upload', 'manual'];
 
 export function Facturas() {
+  const { user, showNotification } = useApp();
   const curYear = new Date().getFullYear();
   const [year, setYear]   = useState(String(curYear));
   const [month, setMonth] = useState('');
@@ -30,6 +33,15 @@ export function Facturas() {
   const [loading, setLoading]   = useState(true);
 
   const [drillId, setDrillId] = useState(null);
+
+  // Limpieza de facturas sin relación
+  const [cleanOpen,     setCleanOpen]     = useState(false);
+  const [cleanPreview,  setCleanPreview]  = useState(null);
+  const [cleanLoading,  setCleanLoading]  = useState(false);
+  const [cleanDeleting, setCleanDeleting] = useState(false);
+  const [cleanConfirm,  setCleanConfirm]  = useState('');
+  const [cleanResult,   setCleanResult]   = useState(null);
+  const CLEAN_PHRASE = 'ELIMINAR SIN RELACION';
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -84,7 +96,8 @@ export function Facturas() {
       // ── Columnas ────────────────────────────────────────────
       ws.columns = [
         { header: 'UUID SAT',        key: 'uuid',        width: 38 },
-        { header: 'Tipo DTE',        key: 'tipo_dte',    width: 12 },
+        { header: 'Tipo DTE',        key: 'tipo_dte',    width: 10 },
+        { header: 'Tipo Doc.',       key: 'tipo_doc_cl', width: 14 },
         { header: 'Emisor',          key: 'emisor',      width: 30 },
         { header: 'NIT Emisor',      key: 'nit',         width: 14 },
         { header: 'Receptor',        key: 'receptor',    width: 30 },
@@ -146,7 +159,8 @@ export function Facturas() {
 
         const row = ws.addRow({
           uuid:       f.numero_autorizacion || '—',
-          tipo_dte:   f.tipo_documento || '—',
+          tipo_dte:   f.tipo_dte || '—',
+          tipo_doc_cl:(f.tipo_documento || '—').replace('_', ' '),
           emisor:     f.nombre_emisor || '—',
           nit:        f.nit_emisor || '—',
           receptor:   f.nombre_receptor || '—',
@@ -191,9 +205,9 @@ export function Facturas() {
       // Fila de totales
       const totalRow = ws.addRow({
         emisor:   'TOTAL',
-        total:    { formula: `SUM(G2:G${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.monto_total) || 0), 0) },
-        pagado:   { formula: `SUM(K2:K${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.monto_pagado) || 0), 0) },
-        pendiente:{ formula: `SUM(L2:L${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.saldo_pendiente) || 0), 0) },
+        total:    { formula: `SUM(H2:H${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.monto_total) || 0), 0) },
+        pagado:   { formula: `SUM(L2:L${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.monto_pagado) || 0), 0) },
+        pendiente:{ formula: `SUM(M2:M${rowIdx - 1})`, result: allFacturas.reduce((a, f) => a + (Number(f.saldo_pendiente) || 0), 0) },
       });
       totalRow.eachCell(cell => {
         cell.font = { bold: true };
@@ -221,6 +235,60 @@ export function Facturas() {
     }
   };
 
+  // ── Limpieza segura de facturas sin relación ──────────────────
+  const buildCleanParams = () => {
+    const { desde, hasta } = periodoToRange(year, month);
+    const params = { desde, hasta };
+    if (estado)  params.estado          = estado;
+    if (tipo)    params.tipo_documento  = tipo;
+    if (origen)  params.origen          = origen;
+    return params;
+  };
+
+  const openCleanModal = async () => {
+    setCleanResult(null);
+    setCleanConfirm('');
+    setCleanPreview(null);
+    setCleanOpen(true);
+    setCleanLoading(true);
+    try {
+      const preview = await facturasAPI.previewSinRelacion(buildCleanParams());
+      setCleanPreview(preview);
+    } catch (e) {
+      showNotification('Error al consultar facturas: ' + e.message, 'error');
+      setCleanOpen(false);
+    } finally {
+      setCleanLoading(false);
+    }
+  };
+
+  const handleCleanDelete = async () => {
+    if (cleanConfirm !== CLEAN_PHRASE) return;
+    setCleanDeleting(true);
+    try {
+      const result = await facturasAPI.eliminarSinRelacion({
+        ...buildCleanParams(),
+        usuario_email: user?.email,
+      });
+      setCleanResult(result);
+      showNotification(`${result.eliminadas} factura(s) eliminada(s)`, 'success');
+      await load();
+    } catch (e) {
+      showNotification('Error al eliminar: ' + e.message, 'error');
+      setCleanResult({ success: false, message: e.message });
+    } finally {
+      setCleanDeleting(false);
+    }
+  };
+
+  const closeCleanModal = () => {
+    if (cleanDeleting) return;
+    setCleanOpen(false);
+    setCleanPreview(null);
+    setCleanConfirm('');
+    setCleanResult(null);
+  };
+
   const inputCls = 'bg-apple-bg border border-apple-border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text';
 
   return (
@@ -234,6 +302,15 @@ export function Facturas() {
           <Button onClick={exportExcel} variant="outline" size="sm" className="gap-1.5" disabled={exporting}>
             <FileSpreadsheet size={14} />
             {exporting ? 'Generando...' : 'Excel'}
+          </Button>
+          <Button
+            onClick={openCleanModal}
+            variant="outline"
+            size="sm"
+            className="gap-1.5 text-apple-error border-apple-error/40 hover:bg-apple-error/10"
+            title="Eliminar facturas sin pagos vinculados"
+          >
+            <Trash2 size={14} /> Limpiar sin relación
           </Button>
           <Button onClick={() => load()} variant="outline" size="sm" className="gap-1.5"><RefreshCw size={14} /></Button>
         </div>
@@ -280,24 +357,29 @@ export function Facturas() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-apple-textSecondary text-xs border-b border-apple-border bg-apple-bgSecondary/40">
-                {['Autorización SAT', 'Emisor', 'Receptor', 'Fecha', 'Total', 'Pagado', 'Pendiente', 'Estado', 'Origen', ''].map(h => (
+                {['Autorización SAT', 'Tipo DTE', 'Emisor', 'Receptor', 'Fecha', 'Total', 'Pagado', 'Pendiente', 'Estado', 'Origen', ''].map(h => (
                   <th key={h} className="px-4 py-3 text-left font-medium whitespace-nowrap">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-apple-border/40">
               {loading ? (
-                <tr><td colSpan={10} className="px-4 py-10 text-center text-apple-textSecondary text-sm">
+                <tr><td colSpan={11} className="px-4 py-10 text-center text-apple-textSecondary text-sm">
                   <RefreshCw size={16} className="animate-spin inline mr-2" />Cargando...
                 </td></tr>
               ) : facturas.length === 0 ? (
-                <tr><td colSpan={10} className="px-4 py-10 text-center text-apple-textSecondary text-sm">
+                <tr><td colSpan={11} className="px-4 py-10 text-center text-apple-textSecondary text-sm">
                   Sin resultados para los filtros seleccionados.
                 </td></tr>
               ) : facturas.map(f => (
                 <tr key={f.id} className="hover:bg-apple-bgSecondary/60 transition-apple">
                   <td className="px-4 py-3 font-mono text-xs text-apple-textSecondary max-w-[120px] truncate" title={f.numero_autorizacion}>
                     {f.numero_autorizacion ? f.numero_autorizacion.slice(0, 8) + '…' : '—'}
+                  </td>
+                  <td className="px-4 py-3 text-xs whitespace-nowrap">
+                    {f.tipo_dte
+                      ? <span className={`px-1.5 py-0.5 rounded font-mono ${f.tipo_dte === 'NCRE' ? 'bg-purple-400/10 text-purple-400' : 'bg-apple-bgSecondary text-apple-textSecondary'}`}>{f.tipo_dte}</span>
+                      : <span className="text-apple-textSecondary">—</span>}
                   </td>
                   <td className="px-4 py-3 max-w-[160px] truncate text-apple-text">{f.nombre_emisor || '—'}</td>
                   <td className="px-4 py-3 max-w-[140px] truncate text-apple-textSecondary">{f.nombre_receptor || '—'}</td>
@@ -347,6 +429,118 @@ export function Facturas() {
       </Card>
 
       <DrillDownModal facturaId={drillId} open={!!drillId} onClose={() => setDrillId(null)} />
+
+      {/* ── Modal de limpieza segura ─────────────────────────── */}
+      <Modal
+        open={cleanOpen}
+        onClose={closeCleanModal}
+        title={cleanResult ? 'Limpieza Completada' : 'Eliminar Facturas Sin Relación'}
+        width="max-w-md"
+      >
+        {cleanResult ? (
+          <div className="space-y-4">
+            <div className={`flex items-start gap-3 p-3 rounded-apple ${
+              cleanResult.success
+                ? 'bg-apple-success/10 border border-apple-success/30'
+                : 'bg-apple-error/10 border border-apple-error/30'
+            }`}>
+              {cleanResult.success
+                ? <CheckCircle2 size={20} className="text-apple-success shrink-0 mt-0.5" />
+                : <AlertTriangle size={20} className="text-apple-error shrink-0 mt-0.5" />}
+              <div>
+                <p className="text-sm font-medium text-apple-text">
+                  {cleanResult.success
+                    ? `${cleanResult.eliminadas} factura${cleanResult.eliminadas !== 1 ? 's' : ''} eliminada${cleanResult.eliminadas !== 1 ? 's' : ''}`
+                    : 'Error al eliminar'}
+                </p>
+                <p className="text-xs text-apple-textSecondary mt-0.5">{cleanResult.message}</p>
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={closeCleanModal}>Cerrar</Button>
+            </div>
+          </div>
+        ) : cleanLoading || !cleanPreview ? (
+          <div className="flex flex-col items-center justify-center py-10 text-apple-textSecondary text-sm">
+            <Loader2 size={18} className="animate-spin mb-2" />
+            Consultando facturas elegibles...
+          </div>
+        ) : cleanPreview.total_eliminables === 0 ? (
+          <div className="space-y-4">
+            <div className="flex items-start gap-3 p-3 bg-apple-bgSecondary border border-apple-border rounded-apple">
+              <CheckCircle2 size={18} className="text-apple-success shrink-0 mt-0.5" />
+              <p className="text-sm text-apple-text">
+                No hay facturas sin relación que se puedan eliminar con los filtros actuales.
+              </p>
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={closeCleanModal}>Cerrar</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-start gap-3 p-3 bg-apple-warning/10 border border-apple-warning/30 rounded-apple">
+              <AlertTriangle size={20} className="text-apple-warning shrink-0 mt-0.5" />
+              <div className="text-sm space-y-2">
+                <p className="font-medium text-apple-warning">
+                  Se eliminarán {cleanPreview.total_eliminables} factura{cleanPreview.total_eliminables !== 1 ? 's' : ''}.
+                </p>
+                <p className="text-xs text-apple-textSecondary">
+                  Solo se eliminarán facturas que cumplen TODAS estas condiciones:
+                </p>
+                <ul className="text-xs text-apple-textSecondary list-disc list-inside space-y-0.5 pl-1">
+                  <li>No tienen ninguna conciliación vinculada</li>
+                  <li>Su <code className="text-apple-text">monto_pagado</code> es 0</li>
+                  <li>Cumplen los filtros activos en pantalla</li>
+                </ul>
+              </div>
+            </div>
+
+            {/* Desglose por estado */}
+            {Object.keys(cleanPreview.por_estado || {}).length > 0 && (
+              <div className="bg-apple-bg border border-apple-border rounded-apple p-3 space-y-1.5">
+                <p className="text-xs text-apple-textSecondary font-medium mb-1">Desglose por estado:</p>
+                {Object.entries(cleanPreview.por_estado).map(([est, count]) => (
+                  <div key={est} className="flex justify-between text-sm">
+                    <span className="text-apple-textSecondary capitalize">{est}</span>
+                    <span className="font-semibold tabular-nums text-apple-text">{count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs font-medium text-apple-textSecondary mb-1.5">
+                Escribe <code className="px-1.5 py-0.5 bg-apple-bgSecondary rounded text-apple-error font-mono text-xs">{CLEAN_PHRASE}</code> para confirmar:
+              </label>
+              <input
+                type="text"
+                className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-error text-apple-text font-mono"
+                value={cleanConfirm}
+                onChange={e => setCleanConfirm(e.target.value)}
+                placeholder={CLEAN_PHRASE}
+                disabled={cleanDeleting}
+                autoFocus
+              />
+            </div>
+
+            <div className="flex gap-2 justify-end pt-2">
+              <Button variant="outline" onClick={closeCleanModal} disabled={cleanDeleting}>
+                Cancelar
+              </Button>
+              <Button
+                onClick={handleCleanDelete}
+                disabled={cleanConfirm !== CLEAN_PHRASE || cleanDeleting}
+                className="gap-1.5 bg-apple-error hover:bg-apple-error/80 border-apple-error disabled:opacity-40"
+              >
+                {cleanDeleting
+                  ? <><Loader2 size={14} className="animate-spin" /> Eliminando...</>
+                  : <><Trash2 size={14} /> Eliminar {cleanPreview.total_eliminables}</>}
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }
