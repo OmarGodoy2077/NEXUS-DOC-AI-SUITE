@@ -50,6 +50,10 @@ export const facturasAPI = {
     const q = new URLSearchParams(params).toString();
     return request(`/facturas/sin-relacion/preview${q ? '?' + q : ''}`);
   },
+  notasCreditoDisponibles: (nitEmisores) => {
+    const q = new URLSearchParams({ nit_emisores: (nitEmisores || []).join(',') }).toString();
+    return request(`/facturas/notas-credito-disponibles?${q}`);
+  },
   eliminarSinRelacion: (body) => request('/facturas/sin-relacion', {
     method: 'DELETE',
     body: JSON.stringify({ confirmacion: 'ELIMINAR SIN RELACION', ...body }),
@@ -75,6 +79,7 @@ export const pagosAPI = {
 export const conciliacionesAPI = {
   crear: (body) => request('/conciliaciones', { method: 'POST', body: JSON.stringify(body) }),
   batch: (body) => request('/conciliaciones/batch', { method: 'POST', body: JSON.stringify(body) }),
+  efectivo: (body) => request('/conciliaciones/efectivo', { method: 'POST', body: JSON.stringify(body) }),
   revertir: (id) => request(`/conciliaciones/${id}`, { method: 'DELETE' }),
   list: (params = {}) => {
     const q = new URLSearchParams(params).toString();

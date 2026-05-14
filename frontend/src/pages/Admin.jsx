@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, Server, Database, DollarSign, Activity, CheckCircle2, AlertTriangle, Download, Trash2, Loader2, Cpu, Sparkles } from 'lucide-react';
+import { Shield, Server, Database, DollarSign, Activity, CheckCircle2, AlertTriangle, Download, Trash2, Loader2, Cpu, Sparkles, TrendingUp, Calculator } from 'lucide-react';
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -27,6 +27,10 @@ export function Admin() {
   // Tokens
   const [tokenStats, setTokenStats] = useState(null);
   const [loadingTokens, setLoadingTokens] = useState(true);
+
+  // Proyección de costo
+  const [projDocs, setProjDocs]       = useState(100);   // archivos por mes
+  const [projUnidad, setProjUnidad]   = useState('mes'); // 'dia' | 'semana' | 'mes'
 
   useEffect(() => {
     adminAPI.tokenStats()
@@ -306,6 +310,116 @@ export function Admin() {
         )}
       </Card>
 
+      {/* ── Card de Proyección de Costos ───────────────────── */}
+      {tokenStats?.total_docs > 0 && (() => {
+        const costoProm = tokenStats.costo_promedio_por_doc || 0;
+        const docsCantidad = Number(projDocs) || 0;
+        // Convertir el input a archivos/mes según unidad
+        const docsPorMes =
+          projUnidad === 'dia'     ? docsCantidad * 30 :
+          projUnidad === 'semana'  ? docsCantidad * 4.33 :
+                                     docsCantidad;
+        const costoMensual = docsPorMes * costoProm;
+        const costoAnual   = costoMensual * 12;
+        const costoDiario  = costoMensual / 30;
+
+        return (
+          <Card className="space-y-4">
+            <div className="flex items-center justify-between border-b border-apple-border pb-4 flex-wrap gap-3">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-apple-bgSecondary rounded-md text-apple-accent">
+                  <Calculator size={20} />
+                </div>
+                <div>
+                  <h2 className="font-semibold text-lg">Proyección de Costos</h2>
+                  <p className="text-xs text-apple-textSecondary mt-0.5">
+                    Estima cuánto se gastará con X archivos · costo promedio actual: <span className="text-apple-success font-medium">${costoProm.toFixed(6)}/doc</span>
+                  </p>
+                </div>
+              </div>
+              {tokenStats.precios && (
+                <div className="flex gap-2 text-[10px] text-apple-textSecondary">
+                  <span className="px-2 py-1 bg-apple-bgSecondary rounded">
+                    Input: <span className="text-apple-text font-medium">${tokenStats.precios.input_por_m}/M</span>
+                  </span>
+                  <span className="px-2 py-1 bg-apple-bgSecondary rounded">
+                    Output: <span className="text-apple-text font-medium">${tokenStats.precios.output_por_m}/M</span>
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Input controles */}
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="flex-1 min-w-[200px]">
+                <label className="block text-xs text-apple-textSecondary mb-1">Cantidad de archivos</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-lg font-semibold tabular-nums focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
+                  value={projDocs}
+                  onChange={e => setProjDocs(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-apple-textSecondary mb-1">Unidad</label>
+                <select
+                  className="bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-accent text-apple-text"
+                  value={projUnidad}
+                  onChange={e => setProjUnidad(e.target.value)}
+                >
+                  <option value="dia">por día</option>
+                  <option value="semana">por semana</option>
+                  <option value="mes">por mes</option>
+                </select>
+              </div>
+              {/* Atajos rápidos */}
+              <div className="flex gap-1.5">
+                {[50, 100, 500, 1000].map(n => (
+                  <button
+                    key={n}
+                    onClick={() => { setProjDocs(n); setProjUnidad('mes'); }}
+                    className="px-2.5 py-1 text-xs rounded-md border border-apple-border bg-apple-bgSecondary hover:bg-apple-bgSecondary/80 text-apple-textSecondary hover:text-apple-text transition-apple"
+                  >
+                    {n}/mes
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Resultados */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+              <ProjStat
+                icon={<TrendingUp size={16} />}
+                label="Costo diario"
+                value={`$${costoDiario.toFixed(4)}`}
+                hint={`≈ ${Math.round(docsPorMes / 30)} docs/día`}
+              />
+              <ProjStat
+                icon={<DollarSign size={16} />}
+                label="Costo mensual"
+                value={`$${costoMensual.toFixed(2)}`}
+                hint={`${Math.round(docsPorMes).toLocaleString()} docs/mes`}
+                accent="text-apple-accent"
+                highlight
+              />
+              <ProjStat
+                icon={<TrendingUp size={16} />}
+                label="Costo anual"
+                value={`$${costoAnual.toFixed(2)}`}
+                hint={`${Math.round(docsPorMes * 12).toLocaleString()} docs/año`}
+              />
+            </div>
+
+            <p className="text-[11px] text-apple-textSecondary leading-relaxed border-t border-apple-border pt-3">
+              Estimación basada en el promedio histórico de tokens por documento ({tokenStats.promedio_total?.toLocaleString()} tk/doc).
+              El costo real puede variar según la complejidad y tamaño de las imágenes procesadas.
+            </p>
+          </Card>
+        );
+      })()}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
         {/* GRÁFICA DE PROCESAMIENTO (Ocupa 2 columnas) */}
@@ -550,6 +664,23 @@ function TokenStat({ icon, label, value, hint, accent = 'text-apple-text' }) {
       </div>
       <p className={`text-xl font-semibold tabular-nums ${accent}`}>{value}</p>
       {hint && <p className="text-[10px] text-apple-textSecondary">{hint}</p>}
+    </div>
+  );
+}
+
+function ProjStat({ icon, label, value, hint, accent = 'text-apple-text', highlight = false }) {
+  return (
+    <div className={`p-4 rounded-lg space-y-1.5 ${
+      highlight
+        ? 'border-2 border-apple-accent/40 bg-apple-accent/5'
+        : 'border border-apple-border bg-apple-bgSecondary/30'
+    }`}>
+      <div className="flex items-center gap-2 text-apple-textSecondary">
+        {icon}
+        <span className="text-xs uppercase tracking-wider">{label}</span>
+      </div>
+      <p className={`text-2xl font-bold tabular-nums ${accent}`}>{value}</p>
+      {hint && <p className="text-[11px] text-apple-textSecondary">{hint}</p>}
     </div>
   );
 }

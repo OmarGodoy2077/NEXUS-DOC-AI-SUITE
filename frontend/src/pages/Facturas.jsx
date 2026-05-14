@@ -78,13 +78,33 @@ export function Facturas() {
       if (estado)  params.estado  = estado;
       if (origen)  params.origen  = origen;
 
-      const { facturas: allFacturas, conciliaciones: allConcs } = await facturasAPI.controlPagos(params);
+      const { facturas: allFacturas, conciliaciones: allConcs, aplicaciones_nc: allAplics = [] }
+        = await facturasAPI.controlPagos(params);
 
       // Agrupar conciliaciones por factura_id
       const concByFactura = {};
       allConcs.forEach(c => {
         if (!concByFactura[c.factura_id]) concByFactura[c.factura_id] = [];
         concByFactura[c.factura_id].push(c);
+      });
+
+      // Diccionario para acceder a facturas por id (para detalles cruzados)
+      const facturaPorId = Object.fromEntries(allFacturas.map(f => [f.id, f]));
+
+      // Aplicaciones de NCRE agrupadas:
+      //   - por factura objetivo (factura_id): qué NCRE le restaron saldo
+      //   - por NCRE (nota_credito_id): a qué facturas se aplicó esta NCRE
+      const ncAplicadasA = {};   // factura_id → [{nc, monto}]
+      const ncAplicacionesDe = {}; // nota_credito_id → [{factura, monto}]
+      allAplics.forEach(a => {
+        const nc = facturaPorId[a.nota_credito_id];
+        const fac = facturaPorId[a.factura_id];
+        if (nc) {
+          (ncAplicacionesDe[a.nota_credito_id] ||= []).push({ factura: fac, monto: Number(a.monto_aplicado) });
+        }
+        if (fac) {
+          (ncAplicadasA[a.factura_id] ||= []).push({ nc, monto: Number(a.monto_aplicado) });
+        }
       });
 
       const wb = new ExcelJS.Workbook();
@@ -126,35 +146,88 @@ export function Facturas() {
       const fmtDate = (d) => d ? new Date(d).toLocaleDateString('es-GT') : '—';
       const capitalize = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
 
+      // Color por estado/tipo
+      const COLOR_PAGADA       = 'FFE8F5E9';  // verde claro
+      const COLOR_PARCIAL      = 'FFFEF3C7';  // amarillo claro
+      const COLOR_NCRE         = 'FFEDE7F6';  // morado claro
+      const COLOR_ANULADA      = 'FFFFEBEE';  // rojo muy claro
+
       let rowIdx = 2;
+
       allFacturas.forEach(f => {
-        const concs = concByFactura[f.id] || [];
-        const isPagada = f.estado === 'pagada';
-        const isParcial = f.estado === 'parcial';
+        const esNcre = f.tipo_documento === 'nota_credito' || f.estado === 'nota_credito';
+        const concs  = concByFactura[f.id] || [];
+        const aplicNCs = ncAplicadasA[f.id] || [];          // NCRE que redujeron esta factura
+        const usosDeEstaNc = ncAplicacionesDe[f.id] || [];  // (solo si f es NCRE) a qué facturas se aplicó
 
         let bancoCell, tipoDocCell, referenciaCell, pagadoCell;
 
-        if (concs.length === 0) {
-          // Sin pagos vinculados
-          bancoCell      = '—';
-          tipoDocCell    = '—';
-          referenciaCell = '—';
-          pagadoCell     = 0;
-        } else if (concs.length === 1) {
-          const c = concs[0];
-          bancoCell      = c.banco || '—';
-          tipoDocCell    = capitalize(c.tipo_pago);
-          referenciaCell = c.numero_cheque_o_referencia || '—';
-          pagadoCell     = Number(c.monto_aplicado) || 0;
-        } else {
-          // Múltiples pagos: concatenar textos y usar fórmula Excel para la suma
-          bancoCell      = [...new Set(concs.map(c => c.banco).filter(Boolean))].join(' / ') || '—';
-          tipoDocCell    = [...new Set(concs.map(c => capitalize(c.tipo_pago)).filter(Boolean))].join(' / ');
-          referenciaCell = concs.map(c => c.numero_cheque_o_referencia || 'S/N').join('\n');
+        // ── Caso 1: NCRE — mostrar a qué factura se aplicó ──
+        if (esNcre) {
+          if (usosDeEstaNc.length === 0) {
+            bancoCell = '—';
+            tipoDocCell = 'Nota crédito';
+            referenciaCell = 'Sin aplicar';
+            pagadoCell = 0;
+          } else {
+            // Resumir uso: a qué factura se aplicó y bajo qué método de pago de esa factura
+            bancoCell      = '—';
+            tipoDocCell    = 'Nota crédito';
+            referenciaCell = usosDeEstaNc
+              .map(u => {
+                const ref = (u.factura?.numero_autorizacion || '').slice(0, 8) + '…';
+                return `Aplicada a ${ref}`;
+              })
+              .join('\n');
+            const montos = usosDeEstaNc.map(u => u.monto);
+            pagadoCell = montos.length === 1
+              ? montos[0]
+              : { formula: montos.join('+'), result: montos.reduce((a, b) => a + b, 0) };
+          }
+        }
+        // ── Caso 2: Factura normal — combinar conciliaciones + aplicaciones NCRE ──
+        else {
+          const partes = []; // descripciones textuales
+          const montos = []; // todos los montos para la fórmula suma
 
-          // Fórmula: los montos individuales sumados — el contador ve cada valor en la barra de fórmulas
-          const montos = concs.map(c => Number(c.monto_aplicado) || 0);
-          pagadoCell    = { formula: montos.join('+'), result: montos.reduce((a, b) => a + b, 0) };
+          // Conciliaciones (cheque/transferencia/efectivo/depósito)
+          concs.forEach(c => {
+            const tipo = capitalize(c.tipo_pago);
+            const banco = c.banco ? c.banco : '';
+            const ref = c.numero_cheque_o_referencia || 'S/N';
+            partes.push({ tipo, banco, ref, monto: Number(c.monto_aplicado) || 0 });
+            montos.push(Number(c.monto_aplicado) || 0);
+          });
+
+          // Aplicaciones de NCRE
+          aplicNCs.forEach(a => {
+            const refNc = (a.nc?.numero_autorizacion || '').slice(0, 8) + '…';
+            partes.push({
+              tipo:  'Nota crédito',
+              banco: '',
+              ref:   `NCRE ${refNc}`,
+              monto: a.monto,
+            });
+            montos.push(a.monto);
+          });
+
+          if (partes.length === 0) {
+            bancoCell = '—';
+            tipoDocCell = '—';
+            referenciaCell = '—';
+            pagadoCell = 0;
+          } else if (partes.length === 1) {
+            const p = partes[0];
+            bancoCell      = p.banco || '—';
+            tipoDocCell    = p.tipo;
+            referenciaCell = p.ref;
+            pagadoCell     = p.monto;
+          } else {
+            bancoCell      = [...new Set(partes.map(p => p.banco).filter(Boolean))].join(' / ') || '—';
+            tipoDocCell    = [...new Set(partes.map(p => p.tipo).filter(Boolean))].join(' / ');
+            referenciaCell = partes.map(p => p.ref).join('\n');
+            pagadoCell     = { formula: montos.join('+'), result: montos.reduce((a, b) => a + b, 0) };
+          }
         }
 
         const row = ws.addRow({
@@ -171,26 +244,36 @@ export function Facturas() {
           referencia: referenciaCell,
           pagado:     pagadoCell,
           pendiente:  Number(f.saldo_pendiente) || 0,
-          estado:     capitalize(f.estado),
+          estado:     capitalize((f.estado || '').replace('_', ' ')),
           origen:     (f.origen || '').replace('_', ' '),
         });
 
-        // Formato numérico quetzales
+        // Formato numérico
         ['total', 'pagado', 'pendiente'].forEach(key => {
-          const cell = row.getCell(key);
-          cell.numFmt = '"Q "#,##0.00';
+          row.getCell(key).numFmt = '"Q "#,##0.00';
         });
 
         // Alineaciones
         row.getCell('referencia').alignment = { wrapText: true, vertical: 'top' };
         row.getCell('uuid').font = { color: { argb: 'FF888888' }, size: 10 };
 
-        // Color de fila por estado
-        const rowColor = isPagada ? 'FFE8F5E9' : isParcial ? 'FFFEF3C7' : null;
+        // Color de fila por tipo/estado (NCRE prevalece sobre estado)
+        let rowColor = null;
+        if (esNcre)                       rowColor = COLOR_NCRE;
+        else if (f.estado === 'pagada')   rowColor = COLOR_PAGADA;
+        else if (f.estado === 'parcial')  rowColor = COLOR_PARCIAL;
+        else if (f.estado === 'anulada')  rowColor = COLOR_ANULADA;
+
         if (rowColor) {
           row.eachCell(cell => {
             cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: rowColor } };
           });
+        }
+
+        // Resaltar columna Tipo DTE si es NCRE
+        if (esNcre) {
+          row.getCell('tipo_dte').font = { bold: true, color: { argb: 'FF6A1B9A' } };
+          row.getCell('estado').font = { bold: true, color: { argb: 'FF6A1B9A' } };
         }
 
         // Borde inferior sutil
@@ -198,7 +281,9 @@ export function Facturas() {
           cell.border = { bottom: { style: 'hair', color: { argb: 'FFD1D5DB' } } };
         });
 
-        if (concs.length > 1) row.height = Math.max(30, concs.length * 16);
+        // Ajustar altura si hay varias líneas en referencia
+        const lineas = (concs.length + aplicNCs.length) || usosDeEstaNc.length || 1;
+        if (lineas > 1) row.height = Math.max(30, lineas * 16);
         rowIdx++;
       });
 

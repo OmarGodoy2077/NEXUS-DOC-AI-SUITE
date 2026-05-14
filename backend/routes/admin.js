@@ -4,13 +4,13 @@ const router = express.Router();
 module.exports = (supabase) => {
 
   // GET /api/admin/token-stats — promedios de consumo de tokens del OCR
-  // Precios actuales de Gemini Flash-Lite (USD por millón de tokens):
-  //   • Input  (prompt + imagen): $0.10
-  //   • Output (respuesta JSON):  $0.40
+  // Precios actuales de Gemini 3.1 Flash-Lite (USD por millón de tokens):
+  //   • Input  (prompt + imagen): $0.50
+  //   • Output (respuesta JSON):  $3.00
   router.get('/token-stats', async (req, res) => {
     try {
-      const PRICE_INPUT_PER_M  = 0.10;
-      const PRICE_OUTPUT_PER_M = 0.40;
+      const PRICE_INPUT_PER_M  = 0.50;
+      const PRICE_OUTPUT_PER_M = 3.00;
 
       const { data, error } = await supabase
         .from('metodos_pago')
@@ -63,13 +63,22 @@ module.exports = (supabase) => {
         .sort((a, b) => a.day.localeCompare(b.day))
         .slice(-7);
 
+      // Costo promedio por documento (sirve para proyecciones)
+      const costo_promedio_por_doc = costo_estimado_usd / total_docs;
+
       res.json({
         total_docs,
-        promedio_total:     Math.round(sumTotal     / total_docs),
-        promedio_prompt:    Math.round(sumPrompt    / total_docs),
-        promedio_respuesta: Math.round(sumRespuesta / total_docs),
-        total_tokens:       sumTotal,
-        costo_estimado_usd: Number(costo_estimado_usd.toFixed(4)),
+        promedio_total:        Math.round(sumTotal     / total_docs),
+        promedio_prompt:       Math.round(sumPrompt    / total_docs),
+        promedio_respuesta:    Math.round(sumRespuesta / total_docs),
+        total_tokens:          sumTotal,
+        costo_estimado_usd:    Number(costo_estimado_usd.toFixed(4)),
+        costo_promedio_por_doc: Number(costo_promedio_por_doc.toFixed(6)),
+        // Precios usados (para mostrar en UI)
+        precios: {
+          input_por_m:  PRICE_INPUT_PER_M,
+          output_por_m: PRICE_OUTPUT_PER_M,
+        },
         modelos: [...modelos],
         ultimos_7_dias,
       });

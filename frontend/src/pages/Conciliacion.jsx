@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Link2, RefreshCw, CheckCircle2, ArrowRight, Search, Trash2,
   Zap, Target, Filter, ChevronDown, ChevronUp, History, X,
-  SortAsc, SortDesc, SquareCheck, Square,
+  SortAsc, SortDesc, SquareCheck, Square, FileMinus, Banknote, Loader2,
 } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -54,6 +54,17 @@ export function Conciliacion() {
   const [notas,          setNotas]            = useState('');
   const [vinculando,     setVinculando]       = useState(false);
   const [confirmOpen,    setConfirmOpen]      = useState(false);
+
+  // ── Notas de crédito disponibles para los emisores seleccionados ──
+  const [ncreDisponibles,   setNcreDisponibles]  = useState([]);
+  const [ncreLoading,       setNcreLoading]      = useState(false);
+  const [ncreAplicaciones,  setNcreAplicaciones] = useState({}); // { nc_id: { factura_id, monto } }
+
+  // ── Pago en efectivo ─────────────────────────────────────────
+  const [efectivoOpen,     setEfectivoOpen]     = useState(false);
+  const [efectivoMonto,    setEfectivoMonto]    = useState('');
+  const [efectivoNotas,    setEfectivoNotas]    = useState('');
+  const [efectivoLoading,  setEfectivoLoading]  = useState(false);
 
   // ── Carga de datos ────────────────────────────────────────────
   const loadFacturas = useCallback(async () => {
@@ -150,12 +161,77 @@ export function Conciliacion() {
 
   const saldoPago  = pagoSeleccionado ? Number(pagoSeleccionado.saldo_disponible) : 0;
 
-  // Monto sugerido: mínimo entre lo que cubre todas las facturas y lo que tiene el pago
+  // ── Cargar NCRE disponibles para los emisores seleccionados ──
+  const nitsEmisoresSel = useMemo(() => {
+    const nits = new Set(facturasSeleccionadas.map(f => f.nit_emisor).filter(Boolean));
+    return [...nits];
+  }, [facturasSeleccionadas]);
+
+  useEffect(() => {
+    if (nitsEmisoresSel.length === 0) {
+      setNcreDisponibles([]);
+      setNcreAplicaciones({});
+      return;
+    }
+    setNcreLoading(true);
+    facturasAPI.notasCreditoDisponibles(nitsEmisoresSel)
+      .then(res => setNcreDisponibles(res.data || []))
+      .catch(() => setNcreDisponibles([]))
+      .finally(() => setNcreLoading(false));
+  }, [nitsEmisoresSel.join(',')]);
+
+  // Limpiar aplicaciones cuya factura ya no esté seleccionada o cuya NCRE ya no esté disponible
+  useEffect(() => {
+    const ncreIds = new Set(ncreDisponibles.map(n => n.id));
+    setNcreAplicaciones(prev => {
+      const next = {};
+      Object.entries(prev).forEach(([ncId, ap]) => {
+        if (ncreIds.has(ncId) && seleccionadas.has(ap.factura_id)) {
+          next[ncId] = ap;
+        }
+      });
+      return next;
+    });
+  }, [seleccionadas, ncreDisponibles]);
+
+  // Total de NCRE aplicadas en esta sesión
+  const totalNcreAplicado = useMemo(
+    () => Object.values(ncreAplicaciones).reduce((acc, ap) => acc + Number(ap.monto || 0), 0),
+    [ncreAplicaciones]
+  );
+
+  // Neto a cuadrar con dinero = pendiente - NCRE aplicadas
+  const totalNetoACuadrar = Math.max(0, totalPendienteSeleccion - totalNcreAplicado);
+
+  // Monto sugerido: mínimo entre el NETO (después de NCRE) y lo que tiene el pago
   useEffect(() => {
     if (!seleccionadas.size || !pagoSeleccionado) { setMontoAplicar(''); return; }
-    const sugerido = Math.min(totalPendienteSeleccion, saldoPago);
+    const sugerido = Math.min(totalNetoACuadrar, saldoPago);
     setMontoAplicar(sugerido.toFixed(2));
-  }, [seleccionadas, pagoSeleccionado, totalPendienteSeleccion, saldoPago]);
+  }, [seleccionadas, pagoSeleccionado, totalNetoACuadrar, saldoPago]);
+
+  // Helpers NCRE
+  const aplicarNcAuto = (nc) => {
+    // Aplica la NCRE a la primera factura seleccionada con saldo pendiente > 0
+    const facturaTarget = facturasSeleccionadas.find(f => Number(f.saldo_pendiente) > 0);
+    if (!facturaTarget) {
+      showNotification('Selecciona al menos una factura para aplicar la NCRE', 'error');
+      return;
+    }
+    const max = Math.min(Number(nc.saldo_disponible), Number(facturaTarget.saldo_pendiente));
+    setNcreAplicaciones(prev => ({
+      ...prev,
+      [nc.id]: { factura_id: facturaTarget.id, monto: max },
+    }));
+  };
+
+  const quitarNc = (nc_id) => {
+    setNcreAplicaciones(prev => {
+      const next = { ...prev };
+      delete next[nc_id];
+      return next;
+    });
+  };
 
   // ── Helpers selección ─────────────────────────────────────────
   const toggleFactura = (id) => {
@@ -178,8 +254,13 @@ export function Conciliacion() {
 
   // ── Lógica de vinculación ─────────────────────────────────────
   const montoNum    = Number(montoAplicar) || 0;
-  const maxMonto    = Math.min(totalPendienteSeleccion, saldoPago);
-  const montoValido = montoNum > 0 && montoNum <= maxMonto + 0.001; // +epsilon por decimales
+  // maxMonto considera las NCRE: el dinero que falta tras aplicarlas
+  const maxMonto    = Math.min(totalNetoACuadrar, saldoPago);
+  // Si solo hay NCRE y cubren todo, el monto puede ser 0
+  const requireMonto = totalNetoACuadrar > 0;
+  const montoValido = requireMonto
+    ? (montoNum > 0 && montoNum <= maxMonto + 0.001)
+    : true;
 
   const handleVincular = () => {
     if (!seleccionadas.size)  { showNotification('Selecciona al menos una factura', 'error'); return; }
@@ -194,37 +275,35 @@ export function Conciliacion() {
     try {
       const facturaIds = facturasSeleccionadas.map(f => f.id);
 
-      if (facturaIds.length === 1) {
-        // Flujo simple — endpoint original
-        await conciliacionesAPI.crear({
-          factura_id:         facturaIds[0],
-          metodo_pago_id:     pagoSeleccionado.id,
-          monto_aplicado:     montoNum,
-          fecha_conciliacion: new Date().toISOString().split('T')[0],
-          usuario_email:      user.email,
-          notas,
-        });
-      } else {
-        // Flujo multi — endpoint batch (distribuye automáticamente)
-        await conciliacionesAPI.batch({
-          factura_ids:        facturaIds,
-          metodo_pago_id:     pagoSeleccionado.id,
-          fecha_conciliacion: new Date().toISOString().split('T')[0],
-          usuario_email:      user.email,
-          notas,
-        });
-      }
+      // Serializar aplicaciones de NCRE para el backend
+      const aplicacionesNcArr = Object.entries(ncreAplicaciones).map(([nc_id, ap]) => ({
+        nota_credito_id: nc_id,
+        factura_id:      ap.factura_id,
+        monto_aplicado:  Number(ap.monto),
+      }));
 
+      // Siempre usamos batch porque ahora soporta tanto 1 factura como N + NCRE
+      await conciliacionesAPI.batch({
+        factura_ids:        facturaIds,
+        metodo_pago_id:     pagoSeleccionado.id,
+        fecha_conciliacion: new Date().toISOString().split('T')[0],
+        usuario_email:      user.email,
+        notas,
+        aplicaciones_nc:    aplicacionesNcArr,
+      });
+
+      const ncMsg = aplicacionesNcArr.length > 0 ? ` + ${aplicacionesNcArr.length} NCRE aplicada(s)` : '';
       showNotification(
         facturaIds.length === 1
-          ? 'Conciliación registrada correctamente'
-          : `${facturaIds.length} facturas conciliadas correctamente`
+          ? `Conciliación registrada${ncMsg}`
+          : `${facturaIds.length} facturas conciliadas${ncMsg}`
       );
 
       setSeleccionadas(new Set());
       setPagoSeleccionado(null);
       setMontoAplicar('');
       setNotas('');
+      setNcreAplicaciones({});
       await Promise.all([loadFacturas(), loadPagos()]);
       if (historialOpen) loadHistorial();
     } catch (e) {
@@ -243,6 +322,61 @@ export function Conciliacion() {
       if (historialOpen) loadHistorial();
     } catch (e) {
       showNotification(e.message, 'error');
+    }
+  };
+
+  // ── Pago en efectivo ─────────────────────────────────────────
+  const abrirEfectivoModal = () => {
+    if (!seleccionadas.size) {
+      showNotification('Selecciona al menos una factura', 'error');
+      return;
+    }
+    setEfectivoMonto(totalNetoACuadrar.toFixed(2));
+    setEfectivoNotas('');
+    setEfectivoOpen(true);
+  };
+
+  const ejecutarPagoEfectivo = async () => {
+    const monto = Number(efectivoMonto);
+    if (!monto || monto <= 0) {
+      showNotification('Ingresa un monto válido', 'error');
+      return;
+    }
+    if (monto > totalNetoACuadrar + 0.001) {
+      showNotification(`El monto excede el neto a cuadrar (${Q(totalNetoACuadrar)})`, 'error');
+      return;
+    }
+    setEfectivoLoading(true);
+    try {
+      const aplicacionesNcArr = Object.entries(ncreAplicaciones).map(([nc_id, ap]) => ({
+        nota_credito_id: nc_id,
+        factura_id:      ap.factura_id,
+        monto_aplicado:  Number(ap.monto),
+      }));
+
+      await conciliacionesAPI.efectivo({
+        factura_ids:     facturasSeleccionadas.map(f => f.id),
+        monto,
+        fecha_pago:      new Date().toISOString().split('T')[0],
+        usuario_email:   user.email,
+        notas:           efectivoNotas,
+        aplicaciones_nc: aplicacionesNcArr,
+        descripcion:     `Pago efectivo · ${facturasSeleccionadas.length} factura(s)`,
+      });
+
+      const ncMsg = aplicacionesNcArr.length > 0 ? ` + ${aplicacionesNcArr.length} NCRE` : '';
+      showNotification(`Pago en efectivo de ${Q(monto)} registrado${ncMsg}`);
+      setSeleccionadas(new Set());
+      setNcreAplicaciones({});
+      setEfectivoOpen(false);
+      setEfectivoMonto('');
+      setEfectivoNotas('');
+      await Promise.all([loadFacturas(), loadPagos()]);
+      if (historialOpen) loadHistorial();
+    } catch (e) {
+      showNotification(e.message, 'error');
+    } finally {
+      setEfectivoLoading(false);
     }
   };
 
@@ -463,15 +597,88 @@ export function Conciliacion() {
                     ))}
                   </div>
                 )}
-                <p className="text-xs text-apple-textSecondary pt-1">
-                  Total pendiente:{' '}
-                  <span className="text-apple-warning font-semibold">{Q(totalPendienteSeleccion)}</span>
-                </p>
+                <div className="pt-1 space-y-0.5">
+                  <p className="text-xs text-apple-textSecondary">
+                    Total pendiente:{' '}
+                    <span className="text-apple-warning font-semibold">{Q(totalPendienteSeleccion)}</span>
+                  </p>
+                  {totalNcreAplicado > 0 && (
+                    <>
+                      <p className="text-xs text-purple-400">
+                        − NCRE aplicada:{' '}
+                        <span className="font-semibold">{Q(totalNcreAplicado)}</span>
+                      </p>
+                      <p className="text-xs text-apple-text pt-0.5 border-t border-apple-border/40 mt-0.5">
+                        Neto a cuadrar:{' '}
+                        <span className="text-apple-success font-bold">{Q(totalNetoACuadrar)}</span>
+                      </p>
+                    </>
+                  )}
+                </div>
               </div>
             ) : (
               <p className="text-xs text-apple-textSecondary italic">← Selecciona una o varias facturas</p>
             )}
           </Card>
+
+          {/* ── NCRE disponibles para los emisores seleccionados ── */}
+          {seleccionadas.size > 0 && (ncreDisponibles.length > 0 || ncreLoading) && (
+            <Card className="p-3 border border-purple-400/30 bg-purple-400/5 space-y-2">
+              <div className="flex items-center gap-1.5 text-xs">
+                <FileMinus size={13} className="text-purple-400" />
+                <span className="font-medium text-purple-400">Notas de crédito disponibles</span>
+                <span className="text-apple-textSecondary">({ncreDisponibles.length})</span>
+              </div>
+
+              {ncreLoading ? (
+                <div className="flex items-center justify-center py-2 text-xs text-apple-textSecondary gap-1.5">
+                  <Loader2 size={12} className="animate-spin" /> Buscando NCRE...
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                  {ncreDisponibles.map(nc => {
+                    const aplicada = ncreAplicaciones[nc.id];
+                    return (
+                      <div
+                        key={nc.id}
+                        className={`flex items-center justify-between text-xs px-2 py-1.5 rounded border transition-apple ${
+                          aplicada ? 'bg-purple-400/10 border-purple-400/40' : 'bg-apple-bg border-apple-border'
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="text-apple-text truncate" title={nc.nombre_emisor}>
+                            {nc.tipo_dte && <span className="text-purple-400 font-mono mr-1">{nc.tipo_dte}</span>}
+                            {nc.nombre_emisor}
+                          </p>
+                          <p className="text-apple-textSecondary text-[10px]">
+                            {fmt(nc.fecha_emision?.split('T')[0])}
+                            {' · '}Disponible: <span className="text-purple-400 font-semibold">{Q(nc.saldo_disponible)}</span>
+                          </p>
+                        </div>
+                        {aplicada ? (
+                          <button
+                            onClick={() => quitarNc(nc.id)}
+                            className="ml-2 px-2 py-1 rounded text-purple-400 hover:bg-purple-400/10 flex items-center gap-1"
+                            title="Quitar aplicación"
+                          >
+                            <X size={11} /> {Q(aplicada.monto)}
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => aplicarNcAuto(nc)}
+                            className="ml-2 px-2 py-1 rounded text-xs text-purple-400 bg-purple-400/10 hover:bg-purple-400/20 font-medium"
+                            title="Aplicar NCRE al cuadre"
+                          >
+                            Aplicar
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Card>
+          )}
 
           <div className="flex justify-center">
             <ArrowRight size={18} className="text-apple-textSecondary rotate-90 lg:rotate-0" />
@@ -493,7 +700,24 @@ export function Conciliacion() {
                 </p>
               </div>
             ) : (
-              <p className="text-xs text-apple-textSecondary italic">→ Selecciona un pago</p>
+              <div className="space-y-2">
+                <p className="text-xs text-apple-textSecondary italic">→ Selecciona un pago</p>
+                {seleccionadas.size > 0 && totalNetoACuadrar > 0 && (
+                  <>
+                    <div className="flex items-center gap-2 text-[10px] text-apple-textSecondary uppercase tracking-wider">
+                      <div className="flex-1 h-px bg-apple-border" />
+                      <span>o</span>
+                      <div className="flex-1 h-px bg-apple-border" />
+                    </div>
+                    <button
+                      onClick={abrirEfectivoModal}
+                      className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-apple-warning/40 bg-apple-warning/5 hover:bg-apple-warning/10 text-apple-warning text-xs font-medium transition-apple"
+                    >
+                      <Banknote size={13} /> Pagar en efectivo ({Q(totalNetoACuadrar)})
+                    </button>
+                  </>
+                )}
+              </div>
             )}
           </Card>
 
@@ -502,18 +726,18 @@ export function Conciliacion() {
             <div className="space-y-3 bg-apple-bgSecondary rounded-apple p-4 border border-apple-border">
               <div className="grid grid-cols-2 gap-2">
                 <button
-                  onClick={() => setMontoAplicar(Math.min(saldoPago, totalPendienteSeleccion).toFixed(2))}
+                  onClick={() => setMontoAplicar(Math.min(saldoPago, totalNetoACuadrar).toFixed(2))}
                   className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-apple-accent/40 bg-apple-accent/5 hover:bg-apple-accent/10 text-apple-accent text-xs font-medium transition-apple"
                 >
                   <Zap size={12} /> Todo el pago
                 </button>
                 <button
-                  onClick={() => saldoPago >= totalPendienteSeleccion && setMontoAplicar(totalPendienteSeleccion.toFixed(2))}
-                  disabled={saldoPago < totalPendienteSeleccion}
+                  onClick={() => saldoPago >= totalNetoACuadrar && setMontoAplicar(totalNetoACuadrar.toFixed(2))}
+                  disabled={saldoPago < totalNetoACuadrar}
                   className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-apple-success/40 bg-apple-success/5 hover:bg-apple-success/10 text-apple-success text-xs font-medium transition-apple disabled:opacity-40 disabled:cursor-not-allowed"
-                  title={saldoPago < totalPendienteSeleccion ? `Pago insuficiente — faltan ${Q(totalPendienteSeleccion - saldoPago)}` : 'Cubrir todo el pendiente seleccionado'}
+                  title={saldoPago < totalNetoACuadrar ? `Pago insuficiente — faltan ${Q(totalNetoACuadrar - saldoPago)}` : 'Cubrir todo el neto a cuadrar'}
                 >
-                  <Target size={12} /> Cubrir todo
+                  <Target size={12} /> Cubrir neto
                 </button>
               </div>
 
@@ -711,10 +935,16 @@ export function Conciliacion() {
               </div>
             )}
             <Row label="Total pendiente" value={Q(totalPendienteSeleccion)} />
+            {totalNcreAplicado > 0 && (
+              <>
+                <Row label="− NCRE aplicada" value={`${Q(totalNcreAplicado)} (${Object.keys(ncreAplicaciones).length})`} />
+                <Row label="= Neto a cuadrar" value={Q(totalNetoACuadrar)} />
+              </>
+            )}
             <Row label="Método de pago" value={`${pagoSeleccionado?.tipo} ${pagoSeleccionado?.banco || ''}`} />
             <Row label="Saldo disponible pago" value={Q(pagoSeleccionado?.saldo_disponible)} />
             <hr className="border-apple-border" />
-            <Row label={seleccionadas.size === 1 ? 'Monto a aplicar' : 'Saldo a distribuir'} value={Q(seleccionadas.size === 1 ? montoAplicar : saldoPago)} bold />
+            <Row label={seleccionadas.size === 1 ? 'Monto a aplicar' : 'Saldo a distribuir'} value={Q(seleccionadas.size === 1 ? montoAplicar : Math.min(saldoPago, totalNetoACuadrar))} bold />
             {notas && <Row label="Notas" value={notas} />}
           </div>
           {seleccionadas.size > 1 && (
@@ -727,6 +957,92 @@ export function Conciliacion() {
             <Button onClick={confirmarVinculacion} className="gap-1.5">
               <CheckCircle2 size={14} />
               {seleccionadas.size === 1 ? 'Confirmar' : `Confirmar ${seleccionadas.size} facturas`}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* ── Modal: pago en efectivo ──────────────────────────── */}
+      <Modal
+        open={efectivoOpen}
+        onClose={efectivoLoading ? () => {} : () => setEfectivoOpen(false)}
+        title="Pago en Efectivo"
+        width="max-w-md"
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 p-3 bg-apple-warning/10 border border-apple-warning/30 rounded-apple">
+            <Banknote size={18} className="text-apple-warning shrink-0 mt-0.5" />
+            <p className="text-sm text-apple-text">
+              Se creará un método de pago tipo <strong>efectivo</strong> por el monto exacto y se conciliará automáticamente con las facturas seleccionadas.
+            </p>
+          </div>
+
+          <div className="bg-apple-bg border border-apple-border rounded-apple p-3 space-y-2 text-sm">
+            <Row label={`${facturasSeleccionadas.length} factura${facturasSeleccionadas.length !== 1 ? 's' : ''}`} value="" />
+            <div className="space-y-0.5 max-h-24 overflow-y-auto">
+              {facturasSeleccionadas.map(f => (
+                <p key={f.id} className="text-xs text-apple-textSecondary pl-2">· {f.nombre_emisor} — {Q(f.saldo_pendiente)}</p>
+              ))}
+            </div>
+            <hr className="border-apple-border my-1" />
+            <Row label="Total pendiente" value={Q(totalPendienteSeleccion)} />
+            {totalNcreAplicado > 0 && (
+              <>
+                <Row label="− NCRE aplicada" value={Q(totalNcreAplicado)} />
+                <Row label="= Neto a cuadrar" value={Q(totalNetoACuadrar)} bold />
+              </>
+            )}
+          </div>
+
+          <div>
+            <label className="text-xs text-apple-textSecondary block mb-1">
+              Monto en efectivo (máx. {Q(totalNetoACuadrar)})
+            </label>
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              max={totalNetoACuadrar}
+              className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-warning text-apple-text"
+              value={efectivoMonto}
+              onChange={e => setEfectivoMonto(e.target.value)}
+              disabled={efectivoLoading}
+              autoFocus
+            />
+            <div className="flex gap-2 mt-1.5">
+              <button
+                onClick={() => setEfectivoMonto(totalNetoACuadrar.toFixed(2))}
+                className="text-xs text-apple-accent hover:underline"
+                type="button"
+              >
+                Cubrir todo
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs text-apple-textSecondary block mb-1">Notas (opcional)</label>
+            <input
+              className="w-full bg-apple-bg border border-apple-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-apple-warning text-apple-text"
+              placeholder="Recibo, persona que pagó..."
+              value={efectivoNotas}
+              onChange={e => setEfectivoNotas(e.target.value)}
+              disabled={efectivoLoading}
+            />
+          </div>
+
+          <div className="flex gap-2 justify-end pt-2">
+            <Button variant="outline" onClick={() => setEfectivoOpen(false)} disabled={efectivoLoading}>
+              Cancelar
+            </Button>
+            <Button
+              onClick={ejecutarPagoEfectivo}
+              disabled={efectivoLoading || !Number(efectivoMonto) || Number(efectivoMonto) > totalNetoACuadrar + 0.001}
+              className="gap-1.5"
+            >
+              {efectivoLoading
+                ? <><Loader2 size={14} className="animate-spin" /> Procesando...</>
+                : <><Banknote size={14} /> Registrar Pago</>}
             </Button>
           </div>
         </div>

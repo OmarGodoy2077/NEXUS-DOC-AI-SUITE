@@ -10,6 +10,8 @@
 --   006 — Trigger soporta monto_total negativo (notas de crédito)
 --   007 — Estado 'nota_credito' en estado_factura
 --   008 — Trigger excluye NCRE del recálculo (estado permanente)
+--   009 — Tabla aplicaciones_nota_credito + funciones aux
+--   010 — Trigger incluye NCRE aplicadas al calcular monto_pagado
 -- ============================================================
 
 -- ─────────────────────────────────────────────
@@ -180,6 +182,28 @@ CREATE TABLE IF NOT EXISTS conciliaciones (
 COMMENT ON TABLE conciliaciones IS 'Vinculación N:M entre facturas y métodos de pago. Soporta pagos parciales y pagos de múltiples facturas con un cheque.';
 
 -- ─────────────────────────────────────────────
+-- TABLA: aplicaciones_nota_credito (migración 009)
+-- Registra el uso de NCRE para ajustar facturas del mismo emisor.
+-- Una NCRE puede dividirse en varias aplicaciones (factura A: Q200, factura B: Q300).
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS aplicaciones_nota_credito (
+  id                    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nota_credito_id       UUID NOT NULL REFERENCES facturas(id) ON DELETE RESTRICT,
+  factura_id            UUID NOT NULL REFERENCES facturas(id) ON DELETE RESTRICT,
+  monto_aplicado        DECIMAL(15,2) NOT NULL CHECK (monto_aplicado > 0),
+  fecha_aplicacion      DATE NOT NULL DEFAULT CURRENT_DATE,
+  usuario_aplicacion    TEXT NOT NULL DEFAULT 'sistema',
+  notas                 TEXT,
+  created_at            TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT distinct_nc_factura UNIQUE (nota_credito_id, factura_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_aplic_nc_nc      ON aplicaciones_nota_credito(nota_credito_id);
+CREATE INDEX IF NOT EXISTS idx_aplic_nc_factura ON aplicaciones_nota_credito(factura_id);
+
+COMMENT ON TABLE aplicaciones_nota_credito IS 'Aplicación de NCRE a facturas del mismo emisor. Una NCRE puede dividirse en varias aplicaciones.';
+
+-- ─────────────────────────────────────────────
 -- TABLA: importaciones_excel
 -- Historial de archivos Excel importados del SAT
 -- ─────────────────────────────────────────────
@@ -250,17 +274,17 @@ DECLARE
   v_factura_id    UUID;
   v_monto_total   DECIMAL(15,2);
   v_monto_pagado  DECIMAL(15,2);
+  v_nc_aplicado   DECIMAL(15,2);
   v_tipo_doc      tipo_documento_fiscal;
   v_nuevo_estado  estado_factura;
 BEGIN
-  -- Determinar qué factura procesar
   IF TG_OP = 'DELETE' THEN
     v_factura_id := OLD.factura_id;
   ELSE
     v_factura_id := NEW.factura_id;
   END IF;
 
-  -- Sumar todo lo conciliado para esta factura
+  -- Sumar conciliaciones de esta factura
   SELECT f.monto_total, f.tipo_documento, COALESCE(SUM(c.monto_aplicado), 0)
   INTO   v_monto_total, v_tipo_doc, v_monto_pagado
   FROM   facturas f
@@ -268,7 +292,13 @@ BEGIN
   WHERE  f.id = v_factura_id
   GROUP  BY f.monto_total, f.tipo_documento;
 
-  -- Notas de crédito: estado fijo 'nota_credito', no participan en conciliaciones (migración 007/008)
+  -- Sumar NCRE aplicadas (migración 010) — cuentan como pago para el estado
+  SELECT COALESCE(SUM(monto_aplicado), 0) INTO v_nc_aplicado
+  FROM   aplicaciones_nota_credito
+  WHERE  factura_id = v_factura_id;
+
+  v_monto_pagado := v_monto_pagado + v_nc_aplicado;
+
   IF v_tipo_doc = 'nota_credito' THEN
     v_nuevo_estado := 'nota_credito';
   ELSIF v_monto_pagado = 0 THEN
@@ -279,7 +309,56 @@ BEGIN
     v_nuevo_estado := 'pagada';
   END IF;
 
-  -- Actualizar factura — preservar estados que no deben recalcularse
+  UPDATE facturas
+  SET    monto_pagado = v_monto_pagado,
+         estado       = v_nuevo_estado,
+         updated_at   = NOW()
+  WHERE  id = v_factura_id
+    AND  estado NOT IN ('anulada', 'nota_credito');
+
+  RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger paralelo sobre aplicaciones_nota_credito: cuando se aplica/revierte una NCRE,
+-- recalcula la factura objetivo con la misma lógica.
+CREATE OR REPLACE FUNCTION fn_recalcular_factura_por_nc()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_factura_id    UUID;
+  v_monto_total   DECIMAL(15,2);
+  v_monto_pagado  DECIMAL(15,2);
+  v_nc_aplicado   DECIMAL(15,2);
+  v_tipo_doc      tipo_documento_fiscal;
+  v_nuevo_estado  estado_factura;
+BEGIN
+  IF TG_OP = 'DELETE' THEN v_factura_id := OLD.factura_id;
+  ELSE                     v_factura_id := NEW.factura_id;
+  END IF;
+
+  SELECT f.monto_total, f.tipo_documento, COALESCE(SUM(c.monto_aplicado), 0)
+  INTO   v_monto_total, v_tipo_doc, v_monto_pagado
+  FROM   facturas f
+  LEFT JOIN conciliaciones c ON c.factura_id = f.id
+  WHERE  f.id = v_factura_id
+  GROUP  BY f.monto_total, f.tipo_documento;
+
+  SELECT COALESCE(SUM(monto_aplicado), 0) INTO v_nc_aplicado
+  FROM   aplicaciones_nota_credito
+  WHERE  factura_id = v_factura_id;
+
+  v_monto_pagado := v_monto_pagado + v_nc_aplicado;
+
+  IF v_tipo_doc = 'nota_credito' THEN
+    v_nuevo_estado := 'nota_credito';
+  ELSIF v_monto_pagado = 0 THEN
+    v_nuevo_estado := 'pendiente';
+  ELSIF v_monto_pagado < v_monto_total THEN
+    v_nuevo_estado := 'parcial';
+  ELSE
+    v_nuevo_estado := 'pagada';
+  END IF;
+
   UPDATE facturas
   SET    monto_pagado = v_monto_pagado,
          estado       = v_nuevo_estado,
@@ -357,6 +436,11 @@ DROP TRIGGER IF EXISTS trg_actualizar_metodo_pago ON conciliaciones;
 CREATE TRIGGER trg_actualizar_metodo_pago
   AFTER INSERT OR UPDATE OR DELETE ON conciliaciones
   FOR EACH ROW EXECUTE FUNCTION fn_actualizar_saldo_metodo_pago();
+
+DROP TRIGGER IF EXISTS trg_recalcular_factura_por_nc ON aplicaciones_nota_credito;
+CREATE TRIGGER trg_recalcular_factura_por_nc
+  AFTER INSERT OR UPDATE OR DELETE ON aplicaciones_nota_credito
+  FOR EACH ROW EXECUTE FUNCTION fn_recalcular_factura_por_nc();
 
 -- Trigger updated_at automático en facturas y metodos_pago
 CREATE OR REPLACE FUNCTION fn_set_updated_at()

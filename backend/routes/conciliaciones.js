@@ -91,15 +91,28 @@ module.exports = (supabase) => {
   });
 
   // POST /api/conciliaciones/batch — conciliar MÚLTIPLES facturas con UN método de pago
-  // El monto del pago se distribuye en orden de selección hasta agotar saldo.
+  // + opcionalmente aplicar NCRE como ajuste previo al cuadre.
+  //
+  // Flujo:
+  //  1) Si vienen aplicaciones_nc: aplica cada NCRE a su factura objetivo (reduce el pendiente)
+  //  2) Distribuye el saldo del método de pago entre las facturas en orden hasta agotar
   router.post('/batch', async (req, res) => {
     try {
-      const { factura_ids, metodo_pago_id, fecha_conciliacion, usuario_email, notas } = req.body;
+      const {
+        factura_ids,
+        metodo_pago_id,
+        fecha_conciliacion,
+        usuario_email,
+        notas,
+        aplicaciones_nc, // [{ nota_credito_id, factura_id, monto_aplicado }]
+      } = req.body;
 
       if (!Array.isArray(factura_ids) || factura_ids.length === 0)
         return res.status(400).json({ error: 'factura_ids debe ser un array no vacío' });
       if (!metodo_pago_id)
         return res.status(400).json({ error: 'metodo_pago_id es requerido' });
+
+      const fechaConc = fecha_conciliacion || new Date().toISOString().split('T')[0];
 
       // Cargar método de pago
       const { data: pago, error: pErr } = await supabase
@@ -111,32 +124,62 @@ module.exports = (supabase) => {
       if (pago.estado === 'anulado')         return res.status(409).json({ error: 'El método de pago está anulado' });
       if (pago.estado === 'utilizado_total') return res.status(409).json({ error: 'El método de pago no tiene saldo disponible' });
 
-      // Cargar todas las facturas seleccionadas
+      // ── 1) Aplicar NCRE (si vienen) ANTES del cuadre con efectivo/cheque ──
+      const aplicacionesCreadas = [];
+      if (Array.isArray(aplicaciones_nc) && aplicaciones_nc.length > 0) {
+        for (const ap of aplicaciones_nc) {
+          if (!ap.nota_credito_id || !ap.factura_id || !ap.monto_aplicado || ap.monto_aplicado <= 0) {
+            return res.status(400).json({ error: 'Aplicación de NCRE inválida: requiere nota_credito_id, factura_id y monto_aplicado > 0' });
+          }
+
+          const { data: app, error: appErr } = await supabase
+            .from('aplicaciones_nota_credito')
+            .insert([{
+              nota_credito_id:    ap.nota_credito_id,
+              factura_id:         ap.factura_id,
+              monto_aplicado:     Number(ap.monto_aplicado),
+              fecha_aplicacion:   fechaConc,
+              usuario_aplicacion: usuario_email || 'sistema',
+              notas:              ap.notas || null,
+            }])
+            .select()
+            .single();
+
+          if (appErr) {
+            return res.status(400).json({ error: `Error aplicando NCRE: ${appErr.message}` });
+          }
+          aplicacionesCreadas.push(app);
+          // El trigger trg_recalcular_factura_por_nc actualiza monto_pagado y estado automáticamente
+        }
+      }
+
+      // ── 2) Cargar facturas con saldo actualizado y validar ──
       const { data: facturas, error: fErr } = await supabase
         .from('facturas')
-        .select('id, nombre_emisor, estado, saldo_pendiente')
+        .select('id, nombre_emisor, estado, saldo_pendiente, monto_total, monto_pagado, tipo_documento')
         .in('id', factura_ids);
       if (fErr) throw fErr;
 
-      // Validar que ninguna esté anulada o pagada
       for (const f of facturas) {
+        if (f.tipo_documento === 'nota_credito') {
+          return res.status(409).json({ error: 'Las notas de crédito no pueden conciliarse directamente. Usa aplicaciones_nc.' });
+        }
         if (f.estado === 'anulada') return res.status(409).json({ error: `Factura de "${f.nombre_emisor}" está anulada` });
-        if (f.estado === 'pagada')  return res.status(409).json({ error: `Factura de "${f.nombre_emisor}" ya está pagada` });
+        if (f.estado === 'pagada')  continue; // ya pagada (quizá por la NCRE) — la saltamos sin error
       }
 
-      // Ordenar por el orden original que mandó el cliente (para respetar prioridad)
+      // Ordenar por orden de selección
       const facturaMap = Object.fromEntries(facturas.map(f => [f.id, f]));
       const ordenadas  = factura_ids.map(id => facturaMap[id]).filter(Boolean);
 
-      // Distribuir saldo disponible entre las facturas en orden
+      // Distribuir saldo del método de pago entre las facturas
       let saldoRestante = Number(pago.saldo_disponible);
       const conciliaciones = [];
-      const fechaConc = fecha_conciliacion || new Date().toISOString().split('T')[0];
 
       for (const f of ordenadas) {
         if (saldoRestante <= 0) break;
         const pendiente = Number(f.saldo_pendiente);
-        if (pendiente <= 0) continue;
+        if (pendiente <= 0) continue;  // ya cubierta (posiblemente por NCRE)
         const montoAplicar = Math.min(saldoRestante, pendiente);
 
         const { data: conc, error: cErr } = await supabase
@@ -159,12 +202,135 @@ module.exports = (supabase) => {
 
       res.status(201).json({
         success: true,
-        total_conciliaciones: conciliaciones.length,
+        total_conciliaciones:    conciliaciones.length,
+        total_nc_aplicadas:      aplicacionesCreadas.length,
         conciliaciones,
-        saldo_restante_pago: saldoRestante,
+        aplicaciones_nc:         aplicacionesCreadas,
+        saldo_restante_pago:     saldoRestante,
       });
     } catch (err) {
       console.error('Error en conciliación batch:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/conciliaciones/efectivo — crear método de pago tipo efectivo + conciliar en una sola op.
+  // No requiere un metodo_pago existente: el pago en efectivo se crea on-the-fly por el monto exacto.
+  router.post('/efectivo', async (req, res) => {
+    try {
+      const {
+        factura_ids,
+        monto,                  // total a pagar en efectivo (se distribuye entre facturas)
+        fecha_pago,
+        usuario_email,
+        notas,
+        aplicaciones_nc,        // opcional: aplicar NCRE primero
+        descripcion,
+      } = req.body;
+
+      if (!Array.isArray(factura_ids) || factura_ids.length === 0)
+        return res.status(400).json({ error: 'factura_ids debe ser un array no vacío' });
+      if (!monto || Number(monto) <= 0)
+        return res.status(400).json({ error: 'monto debe ser > 0' });
+
+      const fechaPago = fecha_pago || new Date().toISOString().split('T')[0];
+
+      // ── 1) Aplicar NCRE primero si vienen ──
+      const aplicacionesCreadas = [];
+      if (Array.isArray(aplicaciones_nc) && aplicaciones_nc.length > 0) {
+        for (const ap of aplicaciones_nc) {
+          if (!ap.nota_credito_id || !ap.factura_id || !ap.monto_aplicado || ap.monto_aplicado <= 0) {
+            return res.status(400).json({ error: 'Aplicación de NCRE inválida' });
+          }
+          const { data: app, error: appErr } = await supabase
+            .from('aplicaciones_nota_credito')
+            .insert([{
+              nota_credito_id:    ap.nota_credito_id,
+              factura_id:         ap.factura_id,
+              monto_aplicado:     Number(ap.monto_aplicado),
+              fecha_aplicacion:   fechaPago,
+              usuario_aplicacion: usuario_email || 'sistema',
+              notas:              ap.notas || null,
+            }])
+            .select()
+            .single();
+          if (appErr) return res.status(400).json({ error: `Error aplicando NCRE: ${appErr.message}` });
+          aplicacionesCreadas.push(app);
+          // El trigger trg_recalcular_factura_por_nc ya actualiza monto_pagado y estado
+        }
+      }
+
+      // ── 2) Crear el método de pago tipo 'efectivo' por el monto exacto ──
+      const { data: nuevoPago, error: pErr } = await supabase
+        .from('metodos_pago')
+        .insert([{
+          tipo:             'efectivo',
+          fecha_documento:  fechaPago,
+          monto_inicial:    Number(monto),
+          descripcion:      descripcion || 'Pago en efectivo',
+          notas:            notas || null,
+          origen:           'manual',
+          usuario_creacion: usuario_email || 'sistema',
+          estado:           'disponible',
+        }])
+        .select()
+        .single();
+      if (pErr) throw pErr;
+
+      // ── 3) Conciliar contra las facturas ──
+      const { data: facturas, error: fErr } = await supabase
+        .from('facturas')
+        .select('id, nombre_emisor, estado, saldo_pendiente, tipo_documento')
+        .in('id', factura_ids);
+      if (fErr) throw fErr;
+
+      for (const f of facturas) {
+        if (f.tipo_documento === 'nota_credito')
+          return res.status(409).json({ error: 'Las notas de crédito no pueden conciliarse directamente.' });
+        if (f.estado === 'anulada')
+          return res.status(409).json({ error: `Factura de "${f.nombre_emisor}" está anulada` });
+      }
+
+      const facturaMap = Object.fromEntries(facturas.map(f => [f.id, f]));
+      const ordenadas  = factura_ids.map(id => facturaMap[id]).filter(Boolean);
+
+      let saldoRestante = Number(monto);
+      const conciliaciones = [];
+
+      for (const f of ordenadas) {
+        if (saldoRestante <= 0) break;
+        const pendiente = Number(f.saldo_pendiente);
+        if (pendiente <= 0) continue;
+        const montoAplicar = Math.min(saldoRestante, pendiente);
+
+        const { data: conc, error: cErr } = await supabase
+          .from('conciliaciones')
+          .insert([{
+            factura_id:          f.id,
+            metodo_pago_id:      nuevoPago.id,
+            monto_aplicado:      montoAplicar,
+            fecha_conciliacion:  fechaPago,
+            usuario_conciliacion: usuario_email || 'sistema',
+            notas:               notas || null,
+          }])
+          .select()
+          .single();
+        if (cErr) throw cErr;
+        conciliaciones.push(conc);
+        saldoRestante -= montoAplicar;
+      }
+
+      res.status(201).json({
+        success: true,
+        metodo_pago:           nuevoPago,
+        total_conciliaciones:  conciliaciones.length,
+        total_nc_aplicadas:    aplicacionesCreadas.length,
+        conciliaciones,
+        aplicaciones_nc:       aplicacionesCreadas,
+        saldo_restante:        saldoRestante,
+      });
+    } catch (err) {
+      console.error('Error en pago efectivo:', err.message);
       res.status(500).json({ error: err.message });
     }
   });

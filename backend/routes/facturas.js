@@ -65,10 +65,20 @@ module.exports = (supabase) => {
         .select('factura_id, conciliacion_id, monto_aplicado, fecha_conciliacion, usuario_conciliacion, tipo_pago, banco, numero_cheque_o_referencia, fecha_pago, estado_pago')
         .in('factura_id', facturaIds)
         .not('conciliacion_id', 'is', null);
-
       if (cErr) throw cErr;
 
-      res.json({ facturas, conciliaciones: conciliaciones || [] });
+      // Aplicaciones de NCRE para mostrar cómo se usaron en el reporte
+      const { data: aplicaciones_nc, error: aErr } = await supabase
+        .from('aplicaciones_nota_credito')
+        .select('id, nota_credito_id, factura_id, monto_aplicado, fecha_aplicacion')
+        .or(`factura_id.in.(${facturaIds.join(',')}),nota_credito_id.in.(${facturaIds.join(',')})`);
+      if (aErr) throw aErr;
+
+      res.json({
+        facturas,
+        conciliaciones:  conciliaciones || [],
+        aplicaciones_nc: aplicaciones_nc || [],
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -101,7 +111,57 @@ module.exports = (supabase) => {
     }
   });
 
-  // GET /api/facturas/sin-relacion/preview — cuenta facturas eliminables (sin conciliaciones)
+  // GET /api/facturas/notas-credito-disponibles?nit_emisores=X,Y
+  // Devuelve NCRE con saldo disponible para los NITs proporcionados.
+  router.get('/notas-credito-disponibles', async (req, res) => {
+    try {
+      const nits = (req.query.nit_emisores || '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+      if (nits.length === 0) return res.json({ data: [] });
+
+      const { data: ncres, error } = await supabase
+        .from('facturas')
+        .select('id, numero_autorizacion, fecha_emision, nombre_emisor, nit_emisor, monto_total, tipo_dte')
+        .eq('tipo_documento', 'nota_credito')
+        .eq('estado', 'nota_credito')
+        .in('nit_emisor', nits)
+        .order('fecha_emision', { ascending: false });
+      if (error) throw error;
+
+      if (!ncres.length) return res.json({ data: [] });
+
+      // Cargar aplicaciones previas para calcular saldo restante de cada NCRE
+      const ids = ncres.map(n => n.id);
+      const { data: aplicaciones, error: aErr } = await supabase
+        .from('aplicaciones_nota_credito')
+        .select('nota_credito_id, monto_aplicado')
+        .in('nota_credito_id', ids);
+      if (aErr) throw aErr;
+
+      const aplicadoPorNc = {};
+      (aplicaciones || []).forEach(a => {
+        aplicadoPorNc[a.nota_credito_id] =
+          (aplicadoPorNc[a.nota_credito_id] || 0) + Number(a.monto_aplicado);
+      });
+
+      const resultado = ncres.map(n => {
+        const total = Math.abs(Number(n.monto_total));
+        const aplicado = aplicadoPorNc[n.id] || 0;
+        return {
+          ...n,
+          monto_total: total,           // siempre positivo en la UI
+          monto_aplicado: aplicado,
+          saldo_disponible: total - aplicado,
+        };
+      }).filter(n => n.saldo_disponible > 0);
+
+      res.json({ data: resultado });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+
   // Aplica los mismos filtros opcionales que listar facturas, para que el botón
   // pueda mostrar "se eliminarán N facturas" antes de confirmar.
   router.get('/sin-relacion/preview', async (req, res) => {
