@@ -4,12 +4,7 @@ import { Search as SearchIcon, FileText } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
-import { createClient } from '@supabase/supabase-js';
-
-// Conexión a Supabase
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+import { transaccionesAPI } from '../services/api';
 
 export function Search() {
   const [query, setQuery] = useState('');
@@ -26,17 +21,7 @@ export function Search() {
     setHasSearched(true);
     
     try {
-      // Búsqueda inteligente en Supabase (Busca en Beneficiario, Fecha o en el texto OCR completo)
-      const searchTerm = `%${query}%`; // Comodines para buscar en cualquier parte del texto
-      
-      const { data, error } = await supabase
-        .from('transacciones')
-        .select('*')
-        .or(`beneficiario.ilike.${searchTerm},raw_ocr.ilike.${searchTerm},fecha_documento.ilike.${searchTerm}`)
-        .order('created_at', { ascending: false });
-
-      if (error) throw error;
-      
+      const { data } = await transaccionesAPI.search(query);
       setResults(data || []);
     } catch (error) {
       console.error("Error en la búsqueda:", error.message);

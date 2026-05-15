@@ -12,6 +12,8 @@
 --   008 — Trigger excluye NCRE del recálculo (estado permanente)
 --   009 — Tabla aplicaciones_nota_credito + funciones aux
 --   010 — Trigger incluye NCRE aplicadas al calcular monto_pagado
+--   011 — RLS estricto: solo service_role accede; anon/authenticated denegados.
+--         Reset-all-data ahora limpia aplicaciones_nota_credito antes de facturas.
 -- ============================================================
 
 -- ─────────────────────────────────────────────
@@ -521,19 +523,48 @@ FROM facturas f
 GROUP BY DATE_TRUNC('month', f.fecha_emision), f.tipo_documento, f.estado;
 
 -- ─────────────────────────────────────────────
--- ROW LEVEL SECURITY (preparado para multi-tenant)
+-- ROW LEVEL SECURITY (migración 011)
+-- Modelo: el backend usa service_role (que bypassa RLS por privilegio
+-- de Postgres). anon y authenticated quedan denegados explícitamente
+-- a nivel de fila. Esto impide que cualquiera con la URL del proyecto
+-- + anon key pueda leer/escribir datos de negocio directamente.
+-- Auth (login/logout) sigue funcionando porque vive en auth.* (schema
+-- aparte) y no depende de estas políticas.
 -- ─────────────────────────────────────────────
-ALTER TABLE facturas          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE metodos_pago      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE conciliaciones    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE importaciones_excel ENABLE ROW LEVEL SECURITY;
+ALTER TABLE facturas                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE metodos_pago              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conciliaciones            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE importaciones_excel       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE aplicaciones_nota_credito ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transacciones             ENABLE ROW LEVEL SECURITY;
 
--- Política permisiva temporal (ajustar con auth real)
-CREATE POLICY "allow_all_authenticated" ON facturas
-  FOR ALL USING (true);
-CREATE POLICY "allow_all_authenticated" ON metodos_pago
-  FOR ALL USING (true);
-CREATE POLICY "allow_all_authenticated" ON conciliaciones
-  FOR ALL USING (true);
-CREATE POLICY "allow_all_authenticated" ON importaciones_excel
-  FOR ALL USING (true);
+-- Limpieza idempotente de políticas legacy permisivas
+DROP POLICY IF EXISTS allow_all_authenticated ON facturas;
+DROP POLICY IF EXISTS allow_all_authenticated ON metodos_pago;
+DROP POLICY IF EXISTS allow_all_authenticated ON conciliaciones;
+DROP POLICY IF EXISTS allow_all_authenticated ON importaciones_excel;
+DROP POLICY IF EXISTS allow_all              ON facturas;
+DROP POLICY IF EXISTS allow_all              ON metodos_pago;
+DROP POLICY IF EXISTS allow_all              ON conciliaciones;
+DROP POLICY IF EXISTS allow_all              ON importaciones_excel;
+DROP POLICY IF EXISTS deny_anon_auth         ON facturas;
+DROP POLICY IF EXISTS deny_anon_auth         ON metodos_pago;
+DROP POLICY IF EXISTS deny_anon_auth         ON conciliaciones;
+DROP POLICY IF EXISTS deny_anon_auth         ON importaciones_excel;
+DROP POLICY IF EXISTS deny_anon_auth         ON aplicaciones_nota_credito;
+DROP POLICY IF EXISTS deny_anon_auth         ON transacciones;
+
+-- Políticas estrictas: anon/authenticated NO ven ni modifican nada.
+-- service_role no aparece aquí porque Postgres lo bypassea automáticamente.
+CREATE POLICY deny_anon_auth ON facturas
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+CREATE POLICY deny_anon_auth ON metodos_pago
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+CREATE POLICY deny_anon_auth ON conciliaciones
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+CREATE POLICY deny_anon_auth ON importaciones_excel
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+CREATE POLICY deny_anon_auth ON aplicaciones_nota_credito
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+CREATE POLICY deny_anon_auth ON transacciones
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);

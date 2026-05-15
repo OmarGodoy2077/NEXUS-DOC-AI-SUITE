@@ -282,14 +282,18 @@ export function Conciliacion() {
         monto_aplicado:  Number(ap.monto),
       }));
 
-      // Siempre usamos batch porque ahora soporta tanto 1 factura como N + NCRE
+      // Siempre usamos batch porque ahora soporta tanto 1 factura como N + NCRE.
+      // monto_total_aplicar es el tope que el usuario eligió del cheque/transferencia:
+      // si pone menos que el saldo disponible del pago, el resto queda como saldo del método
+      // para usarse en otra conciliación.
       await conciliacionesAPI.batch({
-        factura_ids:        facturaIds,
-        metodo_pago_id:     pagoSeleccionado.id,
-        fecha_conciliacion: new Date().toISOString().split('T')[0],
-        usuario_email:      user.email,
+        factura_ids:         facturaIds,
+        metodo_pago_id:      pagoSeleccionado.id,
+        monto_total_aplicar: montoNum > 0 ? montoNum : undefined,
+        fecha_conciliacion:  new Date().toISOString().split('T')[0],
+        usuario_email:       user.email,
         notas,
-        aplicaciones_nc:    aplicacionesNcArr,
+        aplicaciones_nc:     aplicacionesNcArr,
       });
 
       const ncMsg = aplicacionesNcArr.length > 0 ? ` + ${aplicacionesNcArr.length} NCRE aplicada(s)` : '';

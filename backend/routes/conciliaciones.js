@@ -104,13 +104,16 @@ module.exports = (supabase) => {
         fecha_conciliacion,
         usuario_email,
         notas,
-        aplicaciones_nc, // [{ nota_credito_id, factura_id, monto_aplicado }]
+        aplicaciones_nc,        // [{ nota_credito_id, factura_id, monto_aplicado }]
+        monto_total_aplicar,    // tope que el usuario quiere usar del cheque (opcional)
       } = req.body;
 
       if (!Array.isArray(factura_ids) || factura_ids.length === 0)
         return res.status(400).json({ error: 'factura_ids debe ser un array no vacío' });
       if (!metodo_pago_id)
         return res.status(400).json({ error: 'metodo_pago_id es requerido' });
+      if (monto_total_aplicar !== undefined && monto_total_aplicar !== null && Number(monto_total_aplicar) <= 0)
+        return res.status(400).json({ error: 'monto_total_aplicar debe ser mayor a 0 si se especifica' });
 
       const fechaConc = fecha_conciliacion || new Date().toISOString().split('T')[0];
 
@@ -172,8 +175,21 @@ module.exports = (supabase) => {
       const facturaMap = Object.fromEntries(facturas.map(f => [f.id, f]));
       const ordenadas  = factura_ids.map(id => facturaMap[id]).filter(Boolean);
 
-      // Distribuir saldo del método de pago entre las facturas
-      let saldoRestante = Number(pago.saldo_disponible);
+      // Distribuir el tope solicitado por el usuario (o todo el saldo si no especificó).
+      // Validar que el tope no supere lo que realmente queda en el método de pago.
+      const saldoDisponiblePago = Number(pago.saldo_disponible);
+      const topeUsuario = monto_total_aplicar !== undefined && monto_total_aplicar !== null
+        ? Number(monto_total_aplicar)
+        : saldoDisponiblePago;
+
+      if (topeUsuario > saldoDisponiblePago + 0.001) {
+        return res.status(422).json({
+          error: `El monto a aplicar (Q${topeUsuario.toFixed(2)}) excede el saldo disponible del pago (Q${saldoDisponiblePago.toFixed(2)})`,
+          saldo_disponible_pago: saldoDisponiblePago,
+        });
+      }
+
+      let saldoRestante = topeUsuario;
       const conciliaciones = [];
 
       for (const f of ordenadas) {

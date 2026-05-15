@@ -182,6 +182,16 @@ export const scannerAPI = {
   }),
 };
 
+// ── Transacciones (legacy — Search/Viewer) ──────────────────
+export const transaccionesAPI = {
+  search: (q) => request(`/transacciones?q=${encodeURIComponent(q || '')}`),
+  get:    (id) => request(`/transacciones/${id}`),
+  update: (id, body) => request(`/transacciones/${id}`, {
+    method: 'PATCH',
+    body:   JSON.stringify(body),
+  }),
+};
+
 // ── Admin (modo pruebas) ────────────────────────────────────
 export const adminAPI = {
   resetAllData: (usuario_email) => request('/admin/reset-all-data', {

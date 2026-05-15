@@ -5,12 +5,7 @@ import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
-import { createClient } from '@supabase/supabase-js';
-
-// Conexión a Supabase
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+import { transaccionesAPI } from '../services/api';
 
 export function Viewer() {
   const { id } = useParams();
@@ -30,19 +25,12 @@ export function Viewer() {
     const loadDoc = async () => {
       setLoading(true);
       try {
-        const { data, error } = await supabase
-          .from('transacciones')
-          .select('*')
-          .eq('id', id)
-          .single();
-
-        if (error) throw error;
+        const { data } = await transaccionesAPI.get(id);
         setDoc(data);
-        // Inicializamos los datos editables con lo que trajo la base de datos
         setEditedData({
-          beneficiario: data.beneficiario,
-          monto: data.monto,
-          fecha_documento: data.fecha_documento
+          beneficiario:    data.beneficiario,
+          monto:           data.monto,
+          fecha_documento: data.fecha_documento,
         });
       } catch (error) {
         console.error("Error cargando documento:", error.message);
@@ -68,20 +56,13 @@ export function Viewer() {
   const handleSave = async () => {
     setIsSaving(true);
     try {
-      const { error } = await supabase
-        .from('transacciones')
-        .update({
-          beneficiario: editedData.beneficiario,
-          monto: parseFloat(editedData.monto) || 0, // Aseguramos que el monto sea numérico
-          fecha_documento: editedData.fecha_documento
-        })
-        .eq('id', id);
-
-      if (error) throw error;
-      
+      await transaccionesAPI.update(id, {
+        beneficiario:    editedData.beneficiario,
+        monto:           editedData.monto,
+        fecha_documento: editedData.fecha_documento,
+      });
       console.log("✅ Documento actualizado y validado correctamente");
-      // Volvemos al Dashboard general
-      navigate('/dashboard'); 
+      navigate('/dashboard');
     } catch (error) {
       console.error("❌ Error al guardar:", error.message);
       alert("Hubo un error al guardar los cambios.");

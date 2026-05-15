@@ -10,10 +10,11 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ─── Supabase ───────────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+// Backend usa service_role: bypassa RLS automáticamente y permite la lógica
+// de negocio que cruza varias tablas (triggers, deletes en cascada manual, etc.)
+// Nunca exponer esta key al frontend. Fallback temporal a SUPABASE_KEY por compat.
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+const supabase = createClient(process.env.SUPABASE_URL, supabaseKey);
 
 // ─── Google Gemini ──────────────────────────────────────────
 if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'TU_API_KEY_AQUI') {
@@ -34,6 +35,7 @@ const conciliacionesRouter = require('./routes/conciliaciones')(supabase);
 const importacionRouter    = require('./routes/importacionExcel')(supabase);
 const adminRouter          = require('./routes/admin')(supabase);
 const scannerRouter        = require('./routes/scanner')();
+const transaccionesRouter  = require('./routes/transacciones')(supabase);
 
 app.use('/api/facturas',          facturasRouter);
 app.use('/api/metodos-pago',      metodosPagoRouter);
@@ -41,6 +43,7 @@ app.use('/api/conciliaciones',    conciliacionesRouter);
 app.use('/api/importacion-excel', importacionRouter);
 app.use('/api/admin',             adminRouter);
 app.use('/api/scanner',           scannerRouter);
+app.use('/api/transacciones',     transaccionesRouter);
 
 // ─── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {

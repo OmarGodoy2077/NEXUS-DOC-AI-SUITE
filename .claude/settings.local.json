@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "mcp__supabase__execute_sql",
-      "mcp__supabase__apply_migration"
+      "mcp__supabase__apply_migration",
+      "mcp__supabase__get_publishable_keys",
+      "Bash(curl -s -X GET \"http://localhost:3000/api/health\")",
+      "Bash(curl -s -X GET \"http://localhost:3000/api/transacciones?q=test\")",
+      "mcp__supabase__get_advisors"
     ]
   },
   "enableAllProjectMcpServers": true,
