@@ -33,12 +33,14 @@ const metodosPagoRouter    = require('./routes/metodosPago')(supabase);
 const conciliacionesRouter = require('./routes/conciliaciones')(supabase);
 const importacionRouter    = require('./routes/importacionExcel')(supabase);
 const adminRouter          = require('./routes/admin')(supabase);
+const scannerRouter        = require('./routes/scanner')();
 
 app.use('/api/facturas',          facturasRouter);
 app.use('/api/metodos-pago',      metodosPagoRouter);
 app.use('/api/conciliaciones',    conciliacionesRouter);
 app.use('/api/importacion-excel', importacionRouter);
 app.use('/api/admin',             adminRouter);
+app.use('/api/scanner',           scannerRouter);
 
 // ─── Health check ───────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -46,7 +48,7 @@ app.get('/api/health', (req, res) => {
     status: 'OK',
     project: 'NEXUS DOC AI SUITE',
     version: '2.1.0', // Versión actualizada
-    modules: ['facturas', 'metodos-pago', 'conciliaciones', 'importacion-excel', 'admin', `ocr-${GEMINI_MODEL}`],
+    modules: ['facturas', 'metodos-pago', 'conciliaciones', 'importacion-excel', 'admin', 'scanner-wia', `ocr-${GEMINI_MODEL}`],
   });
 });
 
@@ -154,19 +156,20 @@ REGLAS CRÍTICAS FINALES
 5. En CHEQUES, el monto en letras es la verdad absoluta. Si choca con los dígitos manuscritos, RESPETA las letras.
 `;
 
+    // Detectar mimeType desde los primeros bytes del buffer (PNG, JPEG, WebP)
+    const detectMime = (buf) => {
+      if (buf.length < 12) return 'image/png';
+      if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
+      if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+      if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46
+          && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
+      return 'image/png';
+    };
+    const mimeType = detectMime(imageBuffer);
+
     let datosEstructurados = {};
     let tokensUsage = { prompt: null, respuesta: null, total: null };
     try {
-      // Detectar mimeType desde los primeros bytes del buffer (PNG, JPEG, WebP)
-      const detectMime = (buf) => {
-        if (buf.length < 12) return 'image/png';
-        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
-        if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
-        if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46
-            && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
-        return 'image/png';
-      };
-      const mimeType = detectMime(imageBuffer);
 
       const aiResponse = await genAI.models.generateContent({
         model: GEMINI_MODEL,
@@ -285,7 +288,7 @@ REGLAS CRÍTICAS FINALES
     const fileName = `${Date.now()}_${sanitizeFilename(originalFilename)}`;
     const { error: storageError } = await supabase.storage
       .from('comprobantes')
-      .upload(fileName, imageBuffer, { contentType: 'image/png' });
+      .upload(fileName, imageBuffer, { contentType: mimeType });
     if (storageError) throw storageError;
 
     const { data: { publicUrl } } = supabase.storage

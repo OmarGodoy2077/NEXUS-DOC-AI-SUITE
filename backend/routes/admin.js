@@ -109,6 +109,7 @@ module.exports = (supabase) => {
         facturas: 0,
         importaciones_excel: 0,
         transacciones: 0,
+        aplicaciones_nota_credito: 0,
         storage_files: 0,
         errores: [],
       };
@@ -137,11 +138,13 @@ module.exports = (supabase) => {
 
       // ── 2. Eliminar en orden por dependencias FK ───────────────
       // conciliaciones → depende de facturas + metodos_pago
-      // metodos_pago, facturas → independientes una vez sin conciliaciones
+      // aplicaciones_nota_credito → FK RESTRICT hacia facturas (debe ir antes)
+      // metodos_pago, facturas → independientes una vez sin conciliaciones/NCRE
       // transacciones → depende de facturas + metodos_pago
       const tablasOrdenadas = [
         'conciliaciones',
         'transacciones',
+        'aplicaciones_nota_credito',
         'metodos_pago',
         'facturas',
         'importaciones_excel',

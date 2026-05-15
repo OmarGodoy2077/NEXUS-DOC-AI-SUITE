@@ -4,6 +4,61 @@ const headers = {
   'Content-Type': 'application/json',
 };
 
+// ── Compresión de imagen para OCR ───────────────────────────
+// Convierte cualquier base64 (PNG/JPEG/WebP) a JPEG calidad 88 reescalado
+// a un máximo de 2400px de lado largo. Resultado típico: 0.3–2 MB en base64,
+// muy por debajo del límite del backend y suficiente para que Gemini lea
+// cheques manuscritos con precisión. Si la imagen ya es chica, se devuelve
+// tal cual sin recomprimir.
+const MAX_LONG_SIDE_PX = 2400;
+const JPEG_QUALITY     = 0.88;
+const SKIP_COMPRESS_BYTES = 1_500_000; // ~1.5 MB ya es pequeño, no toca
+
+function approxBase64Bytes(b64) {
+  // base64 codifica 3 bytes en 4 chars; restamos padding
+  const padding = (b64.match(/=+$/) || [''])[0].length;
+  return Math.floor((b64.length * 3) / 4) - padding;
+}
+
+export async function compressImageForOCR(imageBase64, mimeHint = 'image/png') {
+  const rawBytes = approxBase64Bytes(imageBase64);
+  if (rawBytes < SKIP_COMPRESS_BYTES) {
+    return { imageBase64, mimeType: mimeHint, originalBytes: rawBytes, finalBytes: rawBytes };
+  }
+
+  const dataUrl = `data:${mimeHint};base64,${imageBase64}`;
+  const img = await new Promise((resolve, reject) => {
+    const el = new Image();
+    el.onload  = () => resolve(el);
+    el.onerror = () => reject(new Error('No se pudo decodificar la imagen para compresión'));
+    el.src = dataUrl;
+  });
+
+  const longSide = Math.max(img.naturalWidth, img.naturalHeight);
+  const scale    = longSide > MAX_LONG_SIDE_PX ? MAX_LONG_SIDE_PX / longSide : 1;
+  const w = Math.round(img.naturalWidth  * scale);
+  const h = Math.round(img.naturalHeight * scale);
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  // Fondo blanco — JPEG no soporta transparencia y los cheques siempre asumen papel blanco
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const jpegDataUrl = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+  const compressedB64 = jpegDataUrl.split(',')[1];
+
+  return {
+    imageBase64:   compressedB64,
+    mimeType:      'image/jpeg',
+    originalBytes: rawBytes,
+    finalBytes:    approxBase64Bytes(compressedB64),
+  };
+}
+
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
     headers: { ...headers, ...options.headers },
@@ -115,6 +170,16 @@ export const excelAPI = {
 // ── Métricas ────────────────────────────────────────────────
 export const metricsAPI = {
   get: () => request('/metrics'),
+};
+
+// ── Scanner ─────────────────────────────────────────────────
+export const scannerAPI = {
+  list: () => request('/scanner/list'),
+  constants: () => request('/scanner/constants'),
+  scan: (body) => request('/scanner/scan', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
 };
 
 // ── Admin (modo pruebas) ────────────────────────────────────

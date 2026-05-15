@@ -5,6 +5,12 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    // open: true
-  }
+    // Evitar que el navegador cachee los módulos durante desarrollo.
+    // Sin esto, cambios en componentes pueden no reflejarse hasta hard refresh.
+    headers: {
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    },
+  },
 })

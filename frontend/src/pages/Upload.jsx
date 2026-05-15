@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, Check, X, AlertTriangle, Trash2 } from 'lucide-react';
+import { Loader2, Check, X, AlertTriangle, Trash2, Upload as UploadIcon, Scan } from 'lucide-react';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Modal } from '../components/ui/Modal';
 import { ImageCropper } from '../components/ImageCropper';
+import { ScannerCapture } from '../components/ScannerCapture';
 import { useApp } from '../context/AppContext';
-import { api, pagosAPI } from '../services/api';
+import { api, pagosAPI, compressImageForOCR } from '../services/api';
 
 export function Upload() {
   const navigate = useNavigate();
@@ -17,6 +18,7 @@ export function Upload() {
   const [isSaving,      setIsSaving]      = useState(false);
   const [isDiscarding,  setIsDiscarding]  = useState(false);
   const [discardOpen,   setDiscardOpen]   = useState(false);
+  const [activeTab,     setActiveTab]     = useState('upload'); // 'upload' | 'scan'
 
   const handleCropComplete = async ({ imageBase64, originalFilename }) => {
     if (!imageBase64) {
@@ -24,12 +26,29 @@ export function Upload() {
       return;
     }
     setIsUploading(true);
-    setPreviewImage(`data:image/png;base64,${imageBase64}`);
+
+    let payloadBase64 = imageBase64;
+    let payloadMime   = 'image/png';
+    try {
+      const compressed = await compressImageForOCR(imageBase64, 'image/png');
+      payloadBase64 = compressed.imageBase64;
+      payloadMime   = compressed.mimeType;
+      if (compressed.finalBytes !== compressed.originalBytes) {
+        const mb = (b) => (b / 1024 / 1024).toFixed(2);
+        console.log(`📦 Imagen comprimida para OCR: ${mb(compressed.originalBytes)} MB → ${mb(compressed.finalBytes)} MB (${payloadMime})`);
+      }
+    } catch (e) {
+      console.warn('No se pudo comprimir la imagen, enviando original:', e.message);
+    }
+
+    setPreviewImage(`data:${payloadMime};base64,${payloadBase64}`);
 
     try {
       const result = await api.processDocument({
-        imageBase64,
-        originalFilename,
+        imageBase64:      payloadBase64,
+        originalFilename: payloadMime === 'image/jpeg'
+          ? originalFilename.replace(/\.[^.]+$/, '') + '.jpg'
+          : originalFilename,
         usuario_email: user?.email || 'sistema@nexus.com',
       });
 
@@ -213,7 +232,7 @@ export function Upload() {
           </Card>
         </div>
       ) : (
-        <Card className="p-6 bg-apple-bgSecondary border border-apple-border">
+        <Card className="p-0 bg-apple-bgSecondary border border-apple-border overflow-hidden">
           {isUploading ? (
             <div className="flex flex-col items-center justify-center h-64">
               <Loader2 size={48} className="animate-spin text-apple-accent" />
@@ -221,7 +240,52 @@ export function Upload() {
               <p className="text-sm text-apple-textSecondary">Esto puede tomar hasta un minuto.</p>
             </div>
           ) : (
-            <ImageCropper onCropComplete={handleCropComplete} />
+            <>
+              {/* ── Tabs: Subir archivo vs Escanear ───────── */}
+              <div className="flex bg-apple-bg p-2 gap-2 border-b border-apple-border">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('upload')}
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-semibold transition-apple ${
+                    activeTab === 'upload'
+                      ? 'bg-apple-accent text-white shadow-md'
+                      : 'text-apple-textSecondary hover:text-apple-text hover:bg-apple-bgSecondary'
+                  }`}
+                >
+                  <UploadIcon size={16} />
+                  Subir archivo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('scan')}
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg text-sm font-semibold transition-apple ${
+                    activeTab === 'scan'
+                      ? 'bg-apple-accent text-white shadow-md'
+                      : 'text-apple-textSecondary hover:text-apple-text hover:bg-apple-bgSecondary'
+                  }`}
+                >
+                  <Scan size={16} />
+                  Escanear documento
+                </button>
+              </div>
+
+              {/* ── Indicador visible del modo actual (cache buster v2) ── */}
+              <div className="px-6 pt-4 pb-2 text-xs text-apple-textSecondary flex items-center gap-2 border-b border-apple-border/40">
+                Modo activo:{' '}
+                <span className="font-mono px-2 py-0.5 rounded bg-apple-bg text-apple-accent">
+                  {activeTab === 'upload' ? '📁 SUBIDA DE ARCHIVO' : '🖨️ ESCANER DIRECTO'}
+                </span>
+              </div>
+
+              {/* ── Contenido de la tab activa ────────────── */}
+              <div className="p-6">
+                {activeTab === 'upload' ? (
+                  <ImageCropper onCropComplete={handleCropComplete} />
+                ) : (
+                  <ScannerCapture onScanComplete={handleCropComplete} />
+                )}
+              </div>
+            </>
           )}
         </Card>
       )}

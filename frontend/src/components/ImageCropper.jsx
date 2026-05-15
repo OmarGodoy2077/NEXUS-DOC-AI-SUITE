@@ -94,7 +94,7 @@ export function ImageCropper({ onCropComplete }) {
   };
 
   return (
-    <div className="w-full p-4 border-2 border-dashed rounded-lg text-center">
+    <div className="relative w-full p-4 border-2 border-dashed border-gray-300 rounded-lg text-center hover:bg-gray-50 transition-colors">
       {!imgSrc && (
         <div className="flex flex-col items-center justify-center h-48">
           <UploadCloud className="w-12 h-12 text-gray-400" />
