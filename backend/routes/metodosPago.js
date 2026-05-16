@@ -25,7 +25,7 @@ module.exports = (supabase) => {
 
       res.json({ data, total: count, page: Number(page), limit: Number(limit) });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: err.message }); 
     }
   });
 

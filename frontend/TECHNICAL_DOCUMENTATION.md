@@ -1,74 +1,262 @@
-# Frontend Technical Documentation - NEXUS DOC AI SUITE v2.0
+# Frontend Technical Documentation — NEXUS DOC AI SUITE v2.1
 
-This document provides a technical overview of the v2.0 frontend application, its architecture, and key implementation details related to the new financial reconciliation features.
+SPA en React 18 + Vite + Tailwind. Documentación técnica del cliente. Para visión global y backend ver [../TECHNICAL_DOCUMENTATION.md](../TECHNICAL_DOCUMENTATION.md).
 
-## 1. Architecture Overview
+---
 
-The frontend remains a React single-page application (SPA) built with Vite and styled with Tailwind CSS. However, its complexity has grown to support the new v2.0 features.
+## 1. Stack
 
-### Core Components & Structure:
+| Categoría        | Librería                          | Uso                                                  |
+|------------------|-----------------------------------|------------------------------------------------------|
+| Framework        | **React 18**                      | UI                                                   |
+| Build            | **Vite 5**                        | Dev server + bundling                                |
+| Routing          | **react-router-dom 6**            | Rutas SPA                                            |
+| Estilos          | **TailwindCSS 3** + `clsx` + `tailwind-merge` | Utility-first + composición       |
+| Auth             | **@supabase/supabase-js**         | Solo login/logout (sin acceso a datos de negocio)    |
+| Iconos           | **lucide-react**                  | Iconografía consistente                              |
+| Gráficas         | **recharts**                      | Dashboard / Admin                                    |
+| Excel            | **exceljs**                       | Preview rápido en el cliente (opcional)              |
+| Image crop       | **react-image-crop**              | Recorte previo al OCR                                |
+| HTTP             | **fetch** nativo                  | `src/services/api.js`                                |
 
-- **`main.jsx`**: Application entry point.
-- **`App.jsx`**: Manages top-level routing and context providers.
-- **`src/pages`**: Contains components for each major feature area:
-  - `Dashboard.jsx`: Displays key metrics and summaries.
-  - `ImportarSAT.jsx`: A new page dedicated to the two-step Excel import process.
-  - `Conciliacion.jsx`: A new, complex page for managing the reconciliation between invoices and payments.
-  - `Facturas.jsx`, `MetodosPago.jsx`: Pages for listing and managing invoices and payment methods.
-- **`src/components`**: Reusable UI components. The `ui` folder contains generic elements (`Button`, `Card`), while the `layout` folder contains structural components (`Header`, `Sidebar`). New components for v2.0 might include data tables, modals for reconciliation, and file uploaders with mapping previews.
-- **`src/context/AppContext.jsx`**: The React Context provider is now more critical, managing shared state like lists of invoices, payment methods, and potentially the state of the current reconciliation process.
-- **`src/services/api.js`**: Expanded to include functions for all new v2.0 API endpoints, such as `analizarExcel`, `confirmarImportacion`, `crearConciliacion`, etc.
+---
 
-## 2. State Management
+## 2. Estructura de archivos
 
-With the added complexity, state management becomes more important.
+```
+frontend/
+├── index.html
+├── vite.config.js          # Dev server en 5173, headers no-cache para hot reload limpio
+├── tailwind.config.js
+├── postcss.config.js
+├── vercel.json             # SPA rewrite para deploy estático
+├── .env / .env.example
+└── src/
+    ├── main.jsx
+    ├── App.jsx             # Rutas
+    ├── index.css           # Tailwind base
+    ├── components/
+    │   ├── ImageCropper.jsx
+    │   ├── ScannerCapture.jsx          # ← Integración con /api/scanner
+    │   ├── finance/
+    │   │   ├── DrillDownModal.jsx
+    │   │   ├── EstadoBadge.jsx
+    │   │   └── PeriodFilter.jsx
+    │   ├── layout/
+    │   │   ├── Header.jsx
+    │   │   ├── Layout.jsx
+    │   │   └── Sidebar.jsx
+    │   └── ui/
+    │       ├── Badge.jsx
+    │       ├── Button.jsx
+    │       ├── Card.jsx
+    │       ├── LoadingSpinner.jsx
+    │       └── Modal.jsx
+    ├── context/
+    │   └── AppContext.jsx              # Auth + notificaciones globales
+    ├── pages/
+    │   ├── Login.jsx                   # Supabase Auth (signInWithPassword)
+    │   ├── Dashboard.jsx
+    │   ├── Facturas.jsx
+    │   ├── MetodosPago.jsx
+    │   ├── Conciliacion.jsx
+    │   ├── ImportarExcel.jsx
+    │   ├── Upload.jsx                  # Drag&drop + Scanner + Cropper + OCR
+    │   ├── Processing.jsx
+    │   ├── Admin.jsx                   # Métricas, tokens, costos, reset
+    │   ├── Search.jsx
+    │   └── Viewer.jsx
+    ├── services/
+    │   ├── api.js                      # Todos los fetch al backend
+    │   └── mockAPI.js
+    └── data/
+        └── mockData.json
+```
 
-- **`AppContext`**: Continues to be used for global state that is shared across many components (e.g., user info, general notifications).
-- **Local Component State (`useState`, `useReducer`)**: For state that is specific to a single page or component, local state is preferred. For example:
-  - The `ImportarSAT.jsx` page will manage the state of the file upload, the suggested column mapping, and the data preview locally.
-  - The `Conciliacion.jsx` modal will manage the selected invoice, selected payment method, and the amount to apply.
-- **Data Fetching & Caching**: For fetching, caching, and re-fetching data from the API, using a dedicated data-fetching library like **React Query (TanStack Query)** or **SWR** is highly recommended. This simplifies loading and error states, reduces boilerplate `useEffect` code, and improves user experience by caching data.
+---
 
-## 3. Key Feature Implementations
+## 3. Rutas
 
-### SAT Excel Import Page (`ImportarSAT.jsx`)
+Definidas en [src/App.jsx](src/App.jsx):
 
-This page implements the two-step import process:
+| Path                | Componente       | Notas                                 |
+|---------------------|------------------|---------------------------------------|
+| `/`                 | `Login`          | Pública                               |
+| `/dashboard`        | `Dashboard`      | Layout principal                      |
+| `/facturas`         | `Facturas`       | Lista + filtros + drill-down          |
+| `/metodos-pago`     | `MetodosPago`    | Cheques/transferencias/efectivo       |
+| `/conciliacion`     | `Conciliacion`   | UI de matching N:M                    |
+| `/importar-excel`   | `ImportarExcel`  | 2-step Excel SAT                      |
+| `/upload`           | `Upload`         | OCR (file/drag&drop/scanner) + crop   |
+| `/admin`            | `Admin`          | Métricas + tokens + costos + reset    |
+| `*`                 | → `/`            | Catch-all                             |
 
-1.  **Step 1: Analysis**
-    - A file input component allows the user to select an Excel file.
-    - On selection, the `api.analizarExcel` function is called.
-    - The component displays a loading state while the backend analyzes the file.
-    - On success, the component receives and stores the suggested mapping and a data preview in its local state. It then renders a table showing the preview and a form allowing the user to review and edit the column mapping.
-2.  **Step 2: Confirmation**
-    - A "Confirm Import" button is enabled once the file is analyzed.
-    - When clicked, the `api.confirmarImportacion` function is called, sending the original file and the final (user-approved) mapping.
-    - The UI shows a progress indicator for the import.
-    - On completion, a success or error notification is displayed, and the user is redirected to the invoices list or dashboard.
+`Layout` envuelve todas las rutas autenticadas con Sidebar + Header.
 
-### Reconciliation Page/Modal (`Conciliacion.jsx`)
+---
 
-This is the most interactive part of the new frontend.
+## 4. Autenticación
 
-1.  **UI Structure**: It likely consists of two main sections or searchable dropdowns: one for selecting an unpaid/partially paid invoice and another for selecting an available payment method.
-2.  **Data Fetching**: It fetches lists of invoices (with `estado=pendiente` or `estado=parcial`) and payment methods (with `estado=disponible` or `estado=utilizado_parcial`) from the API.
-3.  **State Management**: It manages the state for:
-    - The selected invoice (`selectedFactura`).
-    - The selected payment method (`selectedMetodoPago`).
-    - The amount to apply (`montoAplicar`), which is an input field.
-4.  **Logic and Validation**:
-    - The `montoAplicar` input is validated to ensure it is not greater than the invoice's `saldo_pendiente` or the payment's `saldo_disponible`.
-    - The "Reconcile" button is disabled until all required fields are filled and valid.
-5.  **API Call**:
-    - On submit, it calls the `api.crearConciliacion` function with the IDs of the selected items and the amount.
-    - After a successful API call, it should trigger a re-fetch of the invoice and payment data to update the UI with the new balances and statuses. Using a library like React Query would make this re-fetching process declarative and simple.
+[`AppContext.jsx`](src/context/AppContext.jsx):
+- Crea **un único** cliente Supabase con `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY`.
+- Suscribe a `onAuthStateChange` para sincronizar `user`.
+- Expone `signOut`, `showNotification`, `user`, `supabase` por contexto.
 
-## 4. Scaling and Best Practices
+Los componentes **nunca** consultan tablas de Supabase directamente — la RLS los bloquearía. Todas las queries van por `services/api.js` al backend.
 
-1.  **Component Granularity**: Break down complex pages like `Conciliacion.jsx` into smaller, manageable components (e.g., `InvoiceSelector`, `PaymentSelector`, `AmountInput`).
-2.  **Custom Hooks**: Encapsulate complex logic into custom hooks. For example, a `useReconciliation` hook could manage the state and logic for the reconciliation modal. A `useExcelImport` hook could manage the state for the import page.
-3.  **Forms**: For complex forms with validation (like the reconciliation modal), use a dedicated form library like **React Hook Form** or **Formik** to reduce boilerplate and handle validation efficiently.
-4.  **Testing**:
-    - **Unit Tests**: Write tests for custom hooks and complex utility functions.
-    - **Component Tests**: Use React Testing Library to test individual components, especially those with user interaction like the reconciliation modal.
-    - **End-to-End Tests**: Use Cypress or Playwright to test the full user flows, such as uploading an Excel file and completing a reconciliation.
+`Login.jsx` usa `supabase.auth.signInWithPassword({ email, password })`.
+
+---
+
+## 5. Capa de servicios — `src/services/api.js`
+
+Wrappers tipados (sin TypeScript, pero con shape consistente) por dominio:
+
+| Export                  | Endpoints cubiertos                                                        |
+|-------------------------|----------------------------------------------------------------------------|
+| `api.processDocument`   | `POST /api/process-document` (OCR Gemini)                                  |
+| `compressImageForOCR`   | Cliente: recomprime PNG/JPEG/WebP > 1.5 MB a JPEG 88% / max 2400 px        |
+| `facturasAPI`           | list / get / create / update / resumen / control-pagos / notas-credito / sin-relacion |
+| `pagosAPI`              | list / disponibles / get / create / update / confirmar / anular / delete   |
+| `conciliacionesAPI`     | crear / batch / efectivo / revertir / list / reporte                       |
+| `excelAPI`              | analizar / confirmar / historial / campos                                  |
+| `metricsAPI`            | get                                                                        |
+| `scannerAPI`            | list / constants / scan                                                    |
+| `transaccionesAPI`      | search / get / update (legacy v1)                                          |
+| `adminAPI`              | resetAllData / tokenStats                                                  |
+
+Todas usan `fetch(BASE + path, ...)` con `Content-Type: application/json`, parsean JSON y arrojan `Error(json.error)` si `!res.ok`.
+
+### Compresión de imagen antes del OCR
+
+Antes de mandar la imagen al backend, `compressImageForOCR`:
+1. Calcula tamaño aproximado base64.
+2. Si < 1.5 MB → pasa tal cual.
+3. Si > 1.5 MB → carga en `<img>`, dibuja en `<canvas>` reescalando lado largo a 2400 px, exporta `image/jpeg` calidad 0.88.
+
+Esto baja tokens de imagen en Gemini sin perder legibilidad de cheques manuscritos.
+
+---
+
+## 6. Captura desde scanner físico
+
+[`ScannerCapture.jsx`](src/components/ScannerCapture.jsx):
+1. `scannerAPI.list()` al montar → llena el dropdown de dispositivos.
+2. Auto-selecciona el primero.
+3. Controles para DPI (75–600) y modo de color (Color/Grayscale/BW).
+4. `scannerAPI.scan({ deviceId, dpi, colorMode })` → preview + callback `onScanComplete({ imageBase64, originalFilename })`.
+
+Errores comunes que el componente debe mostrar al usuario:
+- `PLATFORM_NOT_SUPPORTED` → "Solo Windows soporta el scanner físico. Usa upload manual."
+- `DEVICE_NOT_FOUND` → "El scanner no está conectado."
+- `TIMEOUT` → "El scanner tardó demasiado, intenta de nuevo."
+
+Se integra en `Upload.jsx` como una pestaña/sección paralela al drag&drop.
+
+---
+
+## 7. Flujos clave
+
+### 7.1 Subir + OCR (`Upload.jsx`)
+
+```
+[Drag&Drop file] ─┐
+                  ├─► imageBase64 → compressImageForOCR
+[Scanner WIA] ────┤   → ImageCropper (opcional) → api.processDocument
+                  │   → mostrar resultado en pantalla
+[Camera/paste] ───┘   → usuario confirma o cancela
+                      → confirmar: pagosAPI.confirmar(id) → estado=disponible
+                      → cancelar:  pagosAPI.delete(id)    → rollback BD + storage
+```
+
+### 7.2 Importar SAT (`ImportarExcel.jsx`)
+
+```
+Paso 1: <input type="file"> → excelAPI.analizar(file)
+        → render preview + form de mapeo editable
+Paso 2: usuario confirma → excelAPI.confirmar(file, mapeo, tipo_documento, usuario_email)
+        → toast con { insertadas, duplicadas, errores }
+```
+
+### 7.3 Conciliación (`Conciliacion.jsx`)
+
+```
+Cargar facturas estado in (pendiente, parcial)
+Cargar metodos_pago estado in (disponible, utilizado_parcial)
+Usuario selecciona factura + método + monto
+Validar: monto <= min(saldo_pendiente, saldo_disponible)
+conciliacionesAPI.crear({ factura_id, metodo_pago_id, monto_aplicado })
+Refetch ambas listas → la UI refleja los nuevos saldos/estados (calculados por triggers)
+```
+
+### 7.4 Admin (`Admin.jsx`)
+
+- `adminAPI.tokenStats()` → KPIs de tokens, costo USD, serie 7 días, proyección por documentos/mes.
+- `adminAPI.resetAllData(usuario_email)` con modal de confirmación que exige escribir `ELIMINAR TODO`. Internamente manda `{ confirmacion: 'RESET NEXUS DOC AI' }`.
+
+---
+
+## 8. Estado y datos
+
+Hoy el estado es **local + Context**. Patrón típico por página:
+- `useState` para lista, filtros, modal abierto.
+- `useEffect` para fetch inicial (sin react-query — fetch + estado plano).
+- Refresco manual tras mutaciones (`await crearX(); await refetchList();`).
+
+Para crecer, evaluar **TanStack Query** (cache, refetch automático, invalidación) en endpoints donde el refresh manual se vuelve frágil (Conciliacion, Admin con polling de stats).
+
+---
+
+## 9. Estilos
+
+- **Tailwind** con tema mínimo en [tailwind.config.js](tailwind.config.js) (paleta tipo Apple: `apple-bg`, `apple-text`, `apple-accent`, `apple-border`).
+- **`clsx` + `tailwind-merge`** para componer clases dinámicas sin colisiones.
+- Componentes UI base en `components/ui/` reutilizan los mismos tokens.
+
+---
+
+## 10. Variables de entorno
+
+`frontend/.env` (plantilla en [.env.example](.env.example)):
+
+```env
+VITE_API_URL=http://localhost:3000/api
+VITE_SUPABASE_URL=https://<project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<anon-key>
+```
+
+Todas las variables expuestas al cliente **deben** prefijarse con `VITE_` para que Vite las inyecte.
+
+---
+
+## 11. Build y deploy
+
+```bash
+cd frontend
+npm run build       # → frontend/dist/
+npm run preview     # sirve dist localmente
+```
+
+`frontend/vercel.json` está preparado para deploy en Vercel:
+```json
+{ "rewrites": [{ "source": "/(.*)", "destination": "/" }] }
+```
+
+En producción debes:
+1. Apuntar `VITE_API_URL` al backend desplegado (HTTPS).
+2. Asegurar que el backend permita CORS desde el dominio del frontend (hoy usa `cors()` sin restricción).
+3. Para usar el scanner WIA en producción, el backend debe correr en Windows + tener acceso al hardware. Si el backend está en Linux/contenedores, el endpoint devolverá 501 y la UI debe mostrarlo de manera amigable.
+
+---
+
+## 12. Buenas prácticas pendientes (roadmap)
+
+- **TanStack Query** para data fetching (caché, refetch, dedupe).
+- **React Hook Form + Zod** para formularios complejos (conciliación, mapeo Excel).
+- **Tests**: Vitest + React Testing Library para hooks/componentes; Playwright para E2E del flujo OCR + conciliación.
+- **Code splitting**: las páginas más pesadas (`Admin` con recharts) se beneficiarían de `lazy()` + `Suspense`.
+- **Tipado**: migrar a TypeScript reduce errores entre `services/api.js` y los componentes consumidores.
+
+---
+
+*Documentación frontend v2.1 — sincronizada con scanner WIA, OCR Gemini y endpoints actualizados (`/api/admin/*`, `/api/conciliaciones/efectivo`, `/api/facturas/sin-relacion`, etc.).*

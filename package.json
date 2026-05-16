@@ -1,4 +1,17 @@
 {
+  "name": "nexus-doc-ai-suite",
+  "private": true,
+  "version": "2.1.0",
+  "description": "Plataforma de procesamiento inteligente de documentos financieros, importación SAT DTE-FEL y conciliación N:M (Guatemala).",
+  "scripts": {
+    "setup": "powershell -ExecutionPolicy Bypass -File ./setup.ps1",
+    "setup:sh": "bash ./setup.sh",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "cleanup:storage": "cd backend && node scripts/cleanup_storage.js"
+  },
   "dependencies": {
     "react-image-crop": "^11.0.10"
   }
